@@ -1,6 +1,6 @@
 /* Wort service worker — cache-first shell so the app opens with no network.
    Bump CACHE on every release; old caches are dropped on activate. */
-const CACHE = "wort-v3.2.0";
+const CACHE = "wort-v3.2.1";
 const SHELL = [
   "./", "./index.html", "./manifest.webmanifest",
   "./icons/icon-192.png", "./icons/icon-512.png", "./icons/icon-maskable-512.png"
@@ -37,8 +37,26 @@ self.addEventListener("fetch", e => {
     return;
   }
 
-  // Everything else in scope: cache first, fall back to the network, then to the shell.
   if (url.origin !== location.origin) return;
+
+  // The page itself is fetched from the network first, so a new build is picked up on
+  // the next load instead of being shadowed by the cache until the version changes.
+  const isPage = req.mode === "navigate" || url.pathname.endsWith("/") ||
+                 url.pathname.endsWith("index.html") || url.pathname.endsWith("sw.js");
+  if (isPage) {
+    e.respondWith(
+      fetch(req).then(res => {
+        if (res && res.status === 200) {
+          const copy = res.clone();
+          caches.open(CACHE).then(c => c.put(req, copy));
+        }
+        return res;
+      }).catch(() => caches.match(req).then(hit => hit || caches.match("./index.html")))
+    );
+    return;
+  }
+
+  // Everything else: cache first, fall back to the network.
   e.respondWith(
     caches.match(req).then(hit => hit || fetch(req).then(res => {
       if (res && res.status === 200) {
