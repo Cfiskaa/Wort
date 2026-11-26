@@ -1,0 +1,23 @@
+{
+  "name": "wort",
+  "version": "2.10.0",
+  "private": true,
+  "description": "Brewing recipe designer and batch log — PWA, Android (Capacitor) and desktop (Tauri) from one web build.",
+  "scripts": {
+    "serve": "npx --yes http-server . -p 8080 -c-1",
+    "cap:add:android": "npx cap add android",
+    "cap:sync": "npx cap sync",
+    "cap:open:android": "npx cap open android",
+    "tauri:init": "npx --yes @tauri-apps/cli init",
+    "tauri:dev": "npx --yes @tauri-apps/cli dev",
+    "tauri:build": "npx --yes @tauri-apps/cli build"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^6.1.2",
+    "@capacitor/cli": "^6.1.2",
+    "@capacitor/core": "^6.1.2"
+  },
+  "dependencies": {
+    "jsdom": "^31.0.1"
+  }
+}
