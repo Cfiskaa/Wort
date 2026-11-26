@@ -471,6 +471,19 @@ function paintTheme(){
   const el=document.documentElement;
   if(t==="auto") el.removeAttribute("data-theme"); else el.setAttribute("data-theme",t);
 }
+/* A stale service worker will happily serve last month's app forever. This throws
+   the cache away and reloads, which is the only reliable way back to current. */
+async function forceUpdate(){
+  flash("Checking for an update\u2026");
+  try{
+    if("serviceWorker" in navigator){
+      const regs=await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r=>r.unregister()));
+    }
+    if(window.caches){ const keys=await caches.keys(); await Promise.all(keys.map(k=>caches.delete(k))); }
+  }catch(e){}
+  location.reload(true);
+}
 function paintSync(){const e=document.getElementById("syncline"); if(e) e.textContent=syncNote;}
 let flashT;
 function flash(msg){
@@ -679,6 +692,9 @@ function paintChrome(){
     + (TIMER?`<hr><div class="dsec">RUNNING</div>
         <button class="dlink" type="button" data-act="d-timer">Brew day<span class="dcount" id="d-clock">${
           fmtMS(tRemain())}</span></button>`:"")
+    + `<hr><div class="dsec">VERSION</div>
+       <div class="dlink" style="cursor:default"><span style="flex:1">Wort ${APP_VERSION}</span></div>
+       <button class="dlink" type="button" data-act="d-update">Check for update</button>`
     + `<hr><div class="dsec">APPEARANCE</div>
        <button class="dlink" type="button" data-th="dark" aria-current="${((S.settings.theme)||"dark")==="dark"}">Dark</button>
        <button class="dlink" type="button" data-th="light" aria-current="${S.settings.theme==="light"}">Light</button>
@@ -1671,6 +1687,7 @@ function doSplit(){
    taking the newer of each pair by id, and honouring a tombstone newer than the record
    it refers to. Nothing is overwritten wholesale, so two devices can both have worked
    offline and neither loses anything but the field the other changed later. */
+const APP_VERSION="3.2.0";
 const SYNC_KEYS=["recipes","batches","inventory","equipProfiles","mashProfiles"];
 
 /* A record is compared ignoring _u, with keys in a fixed order, so a trip through
@@ -1925,7 +1942,7 @@ function syncView(){
   const last=S.sync&&S.sync.lastAt?new Date(S.sync.lastAt).toLocaleString():"never";
   const counts=SYNC_KEYS.map(k=>`${(S[k]||[]).length} ${k==="equipProfiles"?"equipment profiles":k==="mashProfiles"?"mash profiles":k}`).join(" · ");
   return `<div class="panel"><div class="panel-head"><h2>Sync</h2>
-      <span class="small muted">${on?"connected":"not connected"}</span></div>
+      <span class="small muted">Wort ${APP_VERSION} \u00b7 ${on?"connected":"not connected"}</span></div>
     <div class="panel-body">
       ${on?`<p style="margin:0 0 12px">Your library lives in <b>OneDrive → Apps → Wort → wort-data.json</b>.
           Last synced ${esc(last)}.</p>
@@ -2190,6 +2207,7 @@ document.addEventListener("keydown",e=>{ if(e.key==="Escape") menu(false); });
 document.getElementById("drawer").addEventListener("click",e=>{
   const b=e.target.closest("button"); if(!b) return;
   if(b.dataset.tab){ menu(false); nav(()=>{S.tab=b.dataset.tab; S.timerOpen=false; S.recipeView="read";}); return; }
+  if(b.dataset.act==="d-update"){ forceUpdate(); return; }
   if(b.dataset.th){ S.settings.theme=b.dataset.th; save("settings"); paintChrome(); return; }
   if(b.dataset.u2){ S.settings.units=b.dataset.u2; save("settings"); menu(false); render(); return; }
   if(b.dataset.act==="d-timer"&&TIMER){ menu(false); nav(()=>{
