@@ -390,9 +390,9 @@ function calc(r){
 }
 
 /* ========================= state & storage ========================= */
-let S={tab:"recipes",recipes:[],batches:[],inventory:[],equipProfiles:[],mashProfiles:[],
+let S={tab:"recipes",recipes:[],batches:[],inventory:[],equipProfiles:[],mashProfiles:[],tombs:{},sync:{provider:"none",clientId:"",lastAt:0,status:""},
   settings:{units:"us",theme:"dark"},openRecipe:null,openBatch:null};
-const LS="wort:v2:", KEYS=["recipes","batches","inventory","equipProfiles","mashProfiles","settings"];
+const LS="wort:v2:", KEYS=["recipes","batches","inventory","equipProfiles","mashProfiles","settings","tombs","sync"];
 let DB=null,UIDKEY=null,syncNote="Saved on this device.";
 const docPath=k=>"data/users/"+UIDKEY+"/"+k;
 function loadLocal(){
@@ -440,7 +440,10 @@ function migrate(r){
 }
 const pending={};
 function save(k){
+  try{ stamp(k); }catch(e){}
   try{localStorage.setItem(LS+k,JSON.stringify(S[k]));}catch(e){}
+  try{ if(S.tombs) localStorage.setItem(LS+"tombs",JSON.stringify(S.tombs)); }catch(e){}
+  try{ syncSoon(); }catch(e){}
   if(!DB||!UIDKEY) return;
   clearTimeout(pending[k]);
   pending[k]=setTimeout(async()=>{ try{await DB.doc(docPath(k)).set({v:S[k]});}catch(e){} },700);
@@ -659,9 +662,10 @@ function exportBeerXML(list){
 
 /* ========================= render ========================= */
 const app=document.getElementById("app");
-const TABS=[["recipes","Base recipes"],["batches","Batches"],["inventory","Inventory"],["profiles","Profiles"],["tools","Calculators"]];
+const TABS=[["recipes","Base recipes"],["batches","Batches"],["inventory","Inventory"],["profiles","Profiles"],["tools","Calculators"],["sync","Sync"]];
 const TAB_COUNT={recipes:()=>S.recipes.length, batches:()=>S.batches.length,
-  inventory:()=>S.inventory.length, profiles:()=>S.equipProfiles.length+S.mashProfiles.length, tools:()=>null};
+  inventory:()=>S.inventory.length, profiles:()=>S.equipProfiles.length+S.mashProfiles.length, tools:()=>null,
+  sync:()=>null};
 function paintChrome(){
   paintTheme();
   document.getElementById("tabs").innerHTML=TABS.map(([k,l])=>
@@ -706,6 +710,7 @@ function render_(){
   else if(S.tab==="batches") app.innerHTML=S.openBatch?batchEditor():batchList();
   else if(S.tab==="inventory") app.innerHTML=inventoryView();
   else if(S.tab==="profiles") app.innerHTML=profilesView();
+  else if(S.tab==="sync"){ app.innerHTML=syncView(); paintSyncLine(); }
   else app.innerHTML=toolsView();
   if(S.tab==="recipes"&&S.openRecipe) refreshStats();
   if(S.tab==="batches"&&S.openBatch){ refreshStats(); drawFermChart(); paintSession(); }
@@ -1659,6 +1664,296 @@ function doSplit(){
   render();
 }
 
+
+/* ===================== sync ===================== */
+/* OneDrive stores one JSON file, so merging is ours to do. Every record carries the
+   time it last changed; deletions leave a dated tombstone behind. Merging then means
+   taking the newer of each pair by id, and honouring a tombstone newer than the record
+   it refers to. Nothing is overwritten wholesale, so two devices can both have worked
+   offline and neither loses anything but the field the other changed later. */
+const SYNC_KEYS=["recipes","batches","inventory","equipProfiles","mashProfiles"];
+
+/* A record is compared ignoring _u, with keys in a fixed order, so a trip through
+   JSON and back is not mistaken for a change. */
+function stable(v){
+  if(v===undefined) return "\u0000";
+  if(v===null||typeof v!=="object") return JSON.stringify(v);
+  if(Array.isArray(v)) return "["+v.map(stable).join(",")+"]";
+  return "{"+Object.keys(v).filter(k=>k!=="_u").sort()
+    .map(k=>JSON.stringify(k)+":"+stable(v[k])).join(",")+"}";
+}
+const isObj=v=>!!v&&typeof v==="object"&&!Array.isArray(v);
+const idArr=a=>Array.isArray(a)&&a.every(x=>isObj(x)&&x.id!=null);
+
+/* BASE is the copy as it stood at the last successful sync: the common ancestor.
+   Keeping it is what lets a merge tell "I changed this" apart from "they did". */
+let BASE={};
+function loadBase(){ try{ BASE=JSON.parse(localStorage.getItem(LS+"base")||"{}")||{}; }catch(e){ BASE={}; } }
+function rebase(){
+  BASE={};
+  SYNC_KEYS.forEach(k=>{ const m={};
+    (S[k]||[]).forEach(r=>{ if(r&&r.id) m[r.id]=JSON.parse(JSON.stringify(r)); });
+    BASE[k]=m; });
+  try{ localStorage.setItem(LS+"base",JSON.stringify(BASE)); }catch(e){}
+}
+const reshadow=rebase;
+
+/* Three-way merge. Where only one side moved away from the ancestor, that side wins.
+   Where both moved, objects merge key by key and lists of identified rows merge row by
+   row, so a reading added here and a note added there both survive. Only a genuine
+   clash on the same leaf falls back to whichever record was saved later. */
+function merge3(b,l,r,lNew){
+  const sl=stable(l), sr=stable(r);
+  if(sl===sr) return l;
+  const sb=stable(b);
+  if(sb===sl) return r;
+  if(sb===sr) return l;
+  if(isObj(l)&&isObj(r)){
+    const out={}, keys=Object.keys(l).concat(Object.keys(r).filter(k=>!(k in l)));
+    keys.forEach(k=>{
+      const hasB=isObj(b)&&(k in b);
+      let v;
+      if((k in l)&&(k in r)) v=merge3(hasB?b[k]:undefined,l[k],r[k],lNew);
+      else if(k in l) v=(hasB&&stable(b[k])===stable(l[k]))?undefined:l[k];
+      else v=(hasB&&stable(b[k])===stable(r[k]))?undefined:r[k];
+      if(v!==undefined) out[k]=v;
+    });
+    return out;
+  }
+  if(idArr(l)&&idArr(r)){
+    const bm={}; (Array.isArray(b)?b:[]).forEach(x=>{ if(isObj(x)&&x.id!=null) bm[x.id]=x; });
+    const lm={}, rm={};
+    l.forEach(x=>lm[x.id]=x); r.forEach(x=>rm[x.id]=x);
+    const order=l.map(x=>x.id).concat(r.map(x=>x.id).filter(id=>!(id in lm)));
+    const out=[], seen={};
+    order.forEach(id=>{
+      if(seen[id]) return; seen[id]=1;
+      const B=bm[id], L=lm[id], R=rm[id];
+      if(L&&R) out.push(merge3(B,L,R,lNew));
+      else if(L){ if(B&&stable(B)===stable(L)) return; out.push(L); }   /* removed on the other side */
+      else if(R){ if(B&&stable(B)===stable(R)) return; out.push(R); }
+    });
+    return out;
+  }
+  return lNew?l:r;
+}
+
+function stamp(k){
+  if(SYNC_KEYS.indexOf(k)<0) return;
+  const arr=S[k]||[], now=Date.now(), base=BASE[k]||{}, seen={};
+  arr.forEach(r=>{
+    if(!r||typeof r!=="object") return;
+    if(!r.id) r.id=uid();
+    seen[r.id]=1;
+    const b=base[r.id];
+    if(!b||stable(b)!==stable(r)) r._u=now;
+    else if(!r._u) r._u=b._u||now;
+  });
+  S.tombs=S.tombs||{}; S.tombs[k]=S.tombs[k]||{};
+  Object.keys(base).forEach(id=>{ if(!seen[id]) S.tombs[k][id]=now; });
+  Object.keys(seen).forEach(id=>{ if(S.tombs[k][id]) delete S.tombs[k][id]; });
+}
+
+function mergeList(key,local,remote,tombs){
+  const base=BASE[key]||{}, lm={}, rm={};
+  (local||[]).forEach(x=>{ if(x&&x.id) lm[x.id]=x; });
+  (remote||[]).forEach(x=>{ if(x&&x.id) rm[x.id]=x; });
+  const ids=Object.keys(lm).concat(Object.keys(rm).filter(id=>!(id in lm)));
+  const out=[];
+  ids.forEach(id=>{
+    const L=lm[id], R=rm[id];
+    let rec = (L&&R) ? merge3(base[id],L,R,((L._u||0)>=(R._u||0))) : (L||R);
+    if(!rec) return;
+    rec._u=Math.max((L&&L._u)||0,(R&&R._u)||0)||Date.now();
+    if(!((tombs||{})[id]>rec._u)) out.push(rec);
+  });
+  return out;
+}
+function mergeDoc(remote){
+  const rt=(remote&&remote.tombs)||{}, out={changed:false};
+  S.tombs=S.tombs||{};
+  SYNC_KEYS.forEach(k=>{
+    const t=Object.assign({},rt[k]||{});
+    Object.keys(S.tombs[k]||{}).forEach(id=>{ t[id]=Math.max(t[id]||0,S.tombs[k][id]); });
+    const before=stable(S[k]||[]);
+    const merged=mergeList(k, S[k]||[], (remote&&remote.data&&remote.data[k])||[], t);
+    S[k]=merged; S.tombs[k]=t;
+    if(before!==stable(merged)) out.changed=true;
+  });
+  return out;
+}
+function syncDoc(){
+  const data={}; SYNC_KEYS.forEach(k=>data[k]=S[k]||[]);
+  return {v:2, app:"wort", savedAt:Date.now(), data:data, tombs:S.tombs||{}};
+}
+
+let ADAPTER=null, SYNCING=false;
+function syncStatus(msg){ S.sync=S.sync||{}; S.sync.status=msg; paintSyncLine(); }
+function paintSyncLine(){
+  const e=document.getElementById("syncline");
+  if(e) e.textContent=(S.sync&&S.sync.status)||syncNote;
+  const d=document.getElementById("sync-state"); if(d) d.textContent=(S.sync&&S.sync.status)||"";
+}
+async function doSync(reason){
+  if(!ADAPTER||!ADAPTER.signedIn()){ syncStatus("Not connected."); return false; }
+  if(SYNCING) return false;
+  SYNCING=true;
+  try{
+    syncStatus("Syncing…");
+    SYNC_KEYS.forEach(stamp);
+    const remote=await ADAPTER.get();
+    const r=mergeDoc(remote);
+    await ADAPTER.put(syncDoc());
+    reshadow();
+    SYNC_KEYS.forEach(k=>{ try{ localStorage.setItem(LS+k,JSON.stringify(S[k])); }catch(e){} });
+    try{ localStorage.setItem(LS+"tombs",JSON.stringify(S.tombs)); }catch(e){}
+    S.sync.lastAt=Date.now();
+    try{ localStorage.setItem(LS+"sync",JSON.stringify(S.sync)); }catch(e){}
+    syncStatus("Synced "+new Date(S.sync.lastAt).toLocaleTimeString());
+    if(r.changed) render();
+    return true;
+  }catch(e){
+    syncStatus("Sync failed: "+(e&&e.message?e.message:e));
+    return false;
+  } finally { SYNCING=false; }
+}
+let syncTimer=null;
+function syncSoon(){ if(!ADAPTER||!ADAPTER.signedIn()) return;
+  clearTimeout(syncTimer); syncTimer=setTimeout(()=>doSync("edit"),4000); }
+
+
+/* ---------- OneDrive ---------- */
+/* Authorisation code flow with PKCE, which is what a browser app without a secret
+   is meant to use. The file lives in the app's own folder, so the scope asks for
+   nothing beyond what this app created. */
+const OD_AUTH="https://login.microsoftonline.com/common/oauth2/v2.0/";
+const OD_SCOPE="Files.ReadWrite.AppFolder offline_access User.Read";
+const OD_FILE="https://graph.microsoft.com/v1.0/me/drive/special/approot:/wort-data.json:/content";
+const odTok=()=>{ try{ return JSON.parse(localStorage.getItem(LS+"odtok")||"null"); }catch(e){ return null; } };
+const odSet=t=>{ try{ t?localStorage.setItem(LS+"odtok",JSON.stringify(t)):localStorage.removeItem(LS+"odtok"); }catch(e){} };
+const redirectUri=()=>location.origin+location.pathname;
+function b64url(buf){ return btoa(String.fromCharCode.apply(null,new Uint8Array(buf)))
+  .replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
+async function pkce(){
+  const a=new Uint8Array(64); crypto.getRandomValues(a);
+  const verifier=b64url(a.buffer).slice(0,96);
+  const hash=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(verifier));
+  return {verifier, challenge:b64url(hash)};
+}
+async function odSignIn(){
+  const cid=(S.sync&&S.sync.clientId||"").trim();
+  if(!cid){ flash("Paste your application (client) ID first."); return; }
+  const p=await pkce();
+  sessionStorage.setItem(LS+"pkce",p.verifier);
+  sessionStorage.setItem(LS+"cid",cid);
+  location.href=OD_AUTH+"authorize?client_id="+encodeURIComponent(cid)
+    +"&response_type=code&redirect_uri="+encodeURIComponent(redirectUri())
+    +"&response_mode=query&scope="+encodeURIComponent(OD_SCOPE)
+    +"&code_challenge="+p.challenge+"&code_challenge_method=S256";
+}
+async function odExchange(code){
+  const cid=sessionStorage.getItem(LS+"cid")||(S.sync&&S.sync.clientId)||"";
+  const ver=sessionStorage.getItem(LS+"pkce")||"";
+  const body=new URLSearchParams({client_id:cid,grant_type:"authorization_code",code:code,
+    redirect_uri:redirectUri(),code_verifier:ver});
+  const r=await fetch(OD_AUTH+"token",{method:"POST",
+    headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body});
+  const j=await r.json();
+  if(!r.ok) throw new Error(j.error_description||j.error||"sign-in failed");
+  odSet({access:j.access_token,refresh:j.refresh_token,exp:Date.now()+(j.expires_in-120)*1000,cid:cid});
+  sessionStorage.removeItem(LS+"pkce");
+}
+async function odToken(){
+  let t=odTok();
+  if(!t) throw new Error("not signed in");
+  if(Date.now()<t.exp) return t.access;
+  const body=new URLSearchParams({client_id:t.cid,grant_type:"refresh_token",
+    refresh_token:t.refresh,scope:OD_SCOPE});
+  const r=await fetch(OD_AUTH+"token",{method:"POST",
+    headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body});
+  const j=await r.json();
+  if(!r.ok){ odSet(null); throw new Error("sign-in expired, connect again"); }
+  t={access:j.access_token,refresh:j.refresh_token||t.refresh,exp:Date.now()+(j.expires_in-120)*1000,cid:t.cid};
+  odSet(t); return t.access;
+}
+const OneDrive={
+  name:"OneDrive",
+  signedIn:()=>!!odTok(),
+  signIn:odSignIn,
+  signOut(){ odSet(null); S.sync.provider="none"; save("settings"); syncStatus("Disconnected."); render(); },
+  async get(){
+    const tk=await odToken();
+    const r=await fetch(OD_FILE,{headers:{Authorization:"Bearer "+tk}});
+    if(r.status===404) return null;
+    if(!r.ok) throw new Error("read failed ("+r.status+")");
+    return await r.json();
+  },
+  async put(doc){
+    const tk=await odToken();
+    const r=await fetch(OD_FILE,{method:"PUT",
+      headers:{Authorization:"Bearer "+tk,"Content-Type":"application/json"},
+      body:JSON.stringify(doc)});
+    if(!r.ok) throw new Error("write failed ("+r.status+")");
+  }
+};
+function pickAdapter(){
+  ADAPTER = (S.sync&&S.sync.provider==="onedrive") ? OneDrive : null;
+}
+async function syncBoot(){
+  try{
+    const q=new URLSearchParams(location.search);
+    if(q.get("code")){
+      await odExchange(q.get("code"));
+      S.sync=S.sync||{}; S.sync.provider="onedrive";
+      S.sync.clientId=sessionStorage.getItem(LS+"cid")||S.sync.clientId;
+      save("settings"); try{localStorage.setItem(LS+"sync",JSON.stringify(S.sync));}catch(e){}
+      history.replaceState({},"",redirectUri());
+      pickAdapter(); flash("Connected to OneDrive."); await doSync("boot"); render(); return;
+    }
+    if(q.get("error")){ history.replaceState({},"",redirectUri());
+      syncStatus("Sign-in cancelled: "+(q.get("error_description")||q.get("error"))); }
+  }catch(e){ syncStatus("Sign-in failed: "+(e&&e.message?e.message:e)); history.replaceState({},"",redirectUri()); }
+  pickAdapter();
+  if(ADAPTER&&ADAPTER.signedIn()) doSync("boot");
+}
+/* Coming back to the app is the moment the other device's work should land. */
+document.addEventListener("visibilitychange",()=>{ if(!document.hidden) { try{ doSync("focus"); }catch(e){} } });
+window.addEventListener("online",()=>{ try{ doSync("online"); }catch(e){} });
+
+function syncView(){
+  const on=!!(ADAPTER&&ADAPTER.signedIn());
+  const last=S.sync&&S.sync.lastAt?new Date(S.sync.lastAt).toLocaleString():"never";
+  const counts=SYNC_KEYS.map(k=>`${(S[k]||[]).length} ${k==="equipProfiles"?"equipment profiles":k==="mashProfiles"?"mash profiles":k}`).join(" · ");
+  return `<div class="panel"><div class="panel-head"><h2>Sync</h2>
+      <span class="small muted">${on?"connected":"not connected"}</span></div>
+    <div class="panel-body">
+      ${on?`<p style="margin:0 0 12px">Your library lives in <b>OneDrive → Apps → Wort → wort-data.json</b>.
+          Last synced ${esc(last)}.</p>
+        <div class="inline"><button class="btn btn-primary fix" data-act="sync-now">Sync now</button>
+          <button class="btn fix" data-act="sync-out">Disconnect</button></div>`
+      :`<p style="margin:0 0 12px">Sign in with the Microsoft account whose OneDrive should hold the data.
+          You need an application ID from the Azure portal first — the steps are below.</p>
+        <label class="fld" style="margin-bottom:10px"><span>Application (client) ID</span>
+          <input id="cidbox" value="${esc((S.sync&&S.sync.clientId)||"")}" placeholder="00000000-0000-0000-0000-000000000000"></label>
+        <button class="btn btn-primary" data-act="sync-in">Connect OneDrive</button>`}
+      <div class="small muted" id="sync-state" style="margin-top:12px"></div>
+      <div class="note">On this device: ${esc(counts)}.</div>
+    </div></div>
+  <div class="panel"><div class="panel-head"><h2>One-time Azure setup</h2></div>
+    <div class="panel-body small">
+      <p style="margin-top:0">At <b>portal.azure.com</b> → Microsoft Entra ID → App registrations → New registration:</p>
+      <ol style="padding-left:20px;line-height:1.7">
+        <li>Name it anything. Supported account types: <b>personal Microsoft accounts and any organisation</b>.</li>
+        <li>Redirect URI platform <b>Single-page application</b>, value exactly:<br>
+          <code style="word-break:break-all">${esc(redirectUri())}</code></li>
+        <li>Register, then copy the <b>Application (client) ID</b> into the box above.</li>
+        <li>API permissions → Microsoft Graph → Delegated → <b>Files.ReadWrite.AppFolder</b>, <b>offline_access</b>, <b>User.Read</b>.</li>
+      </ol>
+      <p>No client secret, and the app only ever sees its own folder.</p>
+    </div></div>
+  <div class="syncline" id="syncline"></div>`;
+}
+
 /* ===================== brew session ===================== */
 /* What actually happened on the day, beside what the recipe predicted.
    Gravity samples are corrected for temperature before anything is derived from them. */
@@ -2073,6 +2368,12 @@ function appClick(e){
   else if(a==="t-plus"&&TIMER){ TIMER.phases[TIMER.idx].mins+=1; saveTimer(); paintTimer(); }
   else if(a==="t-reset"&&TIMER){ confirmBox("Clear brew day","The running timer and its ticked-off additions are discarded. Your batch and its log are untouched.","Clear",
       ()=>{ TIMER=null; saveTimer(); keepAwake(false); nav(()=>{S.timerOpen=false;}); }); }
+  else if(a==="sync-in"){ const box=document.getElementById("cidbox");
+    S.sync=S.sync||{}; S.sync.clientId=(box&&box.value||"").trim();
+    try{localStorage.setItem(LS+"sync",JSON.stringify(S.sync));}catch(e){}
+    odSignIn(); }
+  else if(a==="sync-out"){ OneDrive.signOut(); }
+  else if(a==="sync-now"){ doSync("manual"); }
   else if(a==="stock-all"&&r){
     const miss=shortNeeds(r).filter(n=>n.short>0.001);
     miss.forEach(n=>addToStock(n.cat,n.name,n.short,n.u));
@@ -2206,6 +2507,8 @@ document.getElementById("dl-hop").innerHTML=HOP_LIB.map(f=>`<option value="${esc
 document.getElementById("dl-yeast").innerHTML=YEAST_LIB.map(f=>`<option value="${esc(f[0])}">`).join("");
 document.getElementById("dl-misc").innerHTML=MISC_LIB.map(f=>`<option value="${esc(f[0])}">`).join("");
 loadLocal();
+loadBase();
+if(!Object.keys(BASE).length) rebase();
 loadTimer();
 if(!S.settings||!S.settings.units) S.settings={units:"us",theme:"dark"};
 if(!S.settings.theme) S.settings.theme="dark";
@@ -2214,6 +2517,7 @@ S.recipes=(S.recipes||[]).map(migrate);
 S.batches=(S.batches||[]).map(migrateBatch);
 render();
 connect();
+syncBoot();
 try{ if("serviceWorker" in navigator && location.protocol!=="blob:") navigator.serviceWorker.register("sw.js").catch(()=>{}); }catch(e){}
 </script>
 </body>
