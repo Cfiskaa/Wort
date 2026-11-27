@@ -281,7 +281,7 @@ const styleOf=n=>{ if(!n) return null;
 
 /* ========================= defaults ========================= */
 const EQ_DEFAULT=()=>({name:"5 gal (19 L) all-grain",batchGal:5,boilMin:60,evapGalHr:1.0,trubGal:0.5,
-  deadspaceGal:0.25,effPct:72,hopUtilPct:100,grainAbsorb:0.12,hopAbsorbGalOz:0,tunGal:0,hltLossF:0});
+  deadspaceGal:0.25,effPct:72,hopUtilPct:100,grainAbsorb:0.12,hopAbsorbGalOz:0,tunGal:0,hltLossF:0,tunThermalQt:0});
 const EQ_SEED=[
   EQ_DEFAULT(),
   {name:"5 gal BIAB, full volume",batchGal:5,boilMin:60,evapGalHr:1.1,trubGal:0.4,deadspaceGal:0,effPct:70,hopUtilPct:100,grainAbsorb:0.08},
@@ -289,7 +289,7 @@ const EQ_SEED=[
   {name:"5 gal extract, partial boil",batchGal:5,boilMin:60,evapGalHr:0.6,trubGal:0.3,deadspaceGal:0,effPct:100,hopUtilPct:90,grainAbsorb:0.12}
 ];
 const MASH_TYPES=["Infusion","Temperature","Decoction","Batch sparge"];
-const MASH_DEFAULT=()=>({name:"Single infusion, medium body",grainTempF:68,spargeTempF:168,thickQtLb:1.33,infuseTempF:212,
+const MASH_DEFAULT=()=>({name:"Single infusion, medium body",grainTempF:68,tunTempF:68,spargeTempF:168,thickQtLb:1.33,infuseTempF:212,
   steps:[{id:uid(),name:"Saccharification",type:"Infusion",tempF:152,timeMin:60,rampMin:0}]});
 const MASH_SEED=[
   MASH_DEFAULT(),
@@ -319,7 +319,13 @@ function mashPlan(r,grainLb){
     if(st.type==="Infusion"){
       if(i===0||waterQt===0){
         infuseQt = G*(num(m.thickQtLb)||1.33);
-        const strike = infuseQt>0 ? (0.2/(num(m.thickQtLb)||1.33))*(T2-cur)+T2 : T2;
+        /* Grain and the tun both take heat out of the strike water. The tun's share is
+           its water-equivalent heat capacity, which is zero until the profile sets one. */
+        const tunQt=num((r.equipment||{}).tunThermalQt);
+        const tunT=m.tunTempF===undefined?num(m.grainTempF):num(m.tunTempF);
+        const strike = infuseQt>0
+          ? T2 + (0.2*G*(T2-cur) + tunQt*(T2-tunT))/infuseQt
+          : T2;
         waterF = strike;
         note = G>0 ? `strike at ${tOut(strike)} ${tLbl()}` : "no mashable grain";
       } else if(T2<=cur){
@@ -464,10 +470,12 @@ function migrateBatch(b){
 function fill(r){
   if(!r) return r;
   if(!r.miscs) r.miscs=[];
+  if(r.mash&&r.mash.tunTempF===undefined) r.mash.tunTempF=num(r.mash.grainTempF)||68;
   (r.hops||[]).forEach(h=>{ if(!h.form) h.form="Pellet"; });
   (r.fermentables||[]).forEach(f=>{ if(f.dp===undefined){
     const lib=FERM_LIB.find(x=>x[0]===f.name); f.dp=lib?lib[4]:(f.kind==="grain"?35:0); } });
   if(r.equipment){ if(r.equipment.hltLossF===undefined) r.equipment.hltLossF=0;
+    if(r.equipment.tunThermalQt===undefined) r.equipment.tunThermalQt=0;
     if(r.equipment.hopAbsorbGalOz===undefined) r.equipment.hopAbsorbGalOz=0;
     if(r.equipment.tunGal===undefined) r.equipment.tunGal=0; }
   return r;
@@ -588,6 +596,10 @@ function importBeerXML(text){
       E.trubGal = kidNum(eq,"TRUB_CHILLER_LOSS",0)/U.galL;
       E.deadspaceGal = kidNum(eq,"LAUTER_DEADSPACE",0)/U.galL;
       const hu=kidNum(eq,"HOP_UTILIZATION",100); if(hu>0) E.hopUtilPct=hu;
+      /* Water equivalent of the tun: its mass times its specific heat, in quarts. */
+      const tw=kidNum(eq,"TUN_WEIGHT",0), tsh=kidNum(eq,"TUN_SPECIFIC_HEAT",0);
+      if(tw>0&&tsh>0) E.tunThermalQt=rnd(tw*tsh/U.qtL,2);
+      if(kidNum(eq,"TUN_VOLUME",0)>0) E.tunGal=rnd(kidNum(eq,"TUN_VOLUME",0)/U.galL,2);
       const er=kidNum(eq,"EVAP_RATE",0), bs=kidNum(eq,"BOIL_SIZE",boilL);
       if(er>0&&bs>0) E.evapGalHr=(bs*er/100)/U.galL;
       else if(boilL>0) E.evapGalHr=Math.max(0,(boilL-batchL)/U.galL)/(boilT/60||1);
@@ -609,6 +621,7 @@ function importBeerXML(text){
     if(ms){
       M.name=kidTxt(ms,"NAME","Imported mash");
       M.grainTempF=C2F(kidNum(ms,"GRAIN_TEMP",20));
+      if(kid(ms,"TUN_TEMP")) M.tunTempF=rnd(C2F(kidNum(ms,"TUN_TEMP",20)),1);
       M.spargeTempF=C2F(kidNum(ms,"SPARGE_TEMP",75.6));
       const steps=kidsOf(ms,"MASH_STEPS","MASH_STEP");
       if(steps.length){
@@ -657,7 +670,12 @@ function importBeerXML(text){
       bsEff: rnd(kidNum(n,"ACTUAL_EFFICIENCY",0),1),
       primaryDays: Math.round(kidNum(n,"PRIMARY_AGE",0)), primaryTempF: rnd(C2F(kidNum(n,"PRIMARY_TEMP",0)),0),
       secondaryDays: Math.round(kidNum(n,"SECONDARY_AGE",0)), secondaryTempF: rnd(C2F(kidNum(n,"SECONDARY_TEMP",0)),0),
-      ageDays: Math.round(kidNum(n,"AGE",0)), carb: rnd(kidNum(n,"CARBONATION_USED",0)||kidNum(n,"CARBONATION",0),2) };
+      ageDays: Math.round(kidNum(n,"AGE",0)),
+      tertiaryDays: Math.round(kidNum(n,"TERTIARY_AGE",0)),
+      ageTempF: rnd(C2F(kidNum(n,"AGE_TEMP",0)),0),
+      stages: Math.round(kidNum(n,"FERMENTATION_STAGES",0)),
+      carbVols: rnd(kidNum(n,"CARBONATION",0),2),
+      carbUsed: kidTxt(n,"CARBONATION_USED","") };
     return r;
   });
 }
@@ -748,7 +766,11 @@ function currentSectionName(){
   }
   const t=TABS.find(x=>x[0]===S.tab); return t?t[1]:"Wort";
 }
-function paintNavNow(){ const e=document.getElementById("navnow"); if(e) e.textContent=currentSectionName(); }
+function paintNavNow(){ const e=document.getElementById("navnow"); if(e) e.textContent=currentSectionName();
+  /* Keep the live tab in view when the section changed by swiping rather than tapping. */
+  const act=document.querySelector('.secbar .tab[aria-current="true"]');
+  if(act&&act.scrollIntoView){ try{ act.scrollIntoView({inline:"center",block:"nearest",behavior:"smooth"}); }catch(e2){} }
+}
 function paintChrome(){
   paintTheme();
   document.getElementById("tabs").innerHTML=TABS.map(([k,l])=>
@@ -863,6 +885,11 @@ function batchFromImport(r,c,L){
   if(L.secondaryTempF) se.secondaryTempF=L.secondaryTempF;
   if(L.ageDays) se.ageDays=L.ageDays;
   if(L.bsEff) se.bsEff=L.bsEff;
+  if(L.tertiaryDays) se.tertiaryDays=L.tertiaryDays;
+  if(L.ageTempF) se.ageTempF=L.ageTempF;
+  if(L.stages) se.stages=L.stages;
+  if(L.carbUsed) se.carbUsed=L.carbUsed;
+  if(L.carbVols) se.carbVols=L.carbVols;
   let packaged="";
   if(L.date&&(L.primaryDays||L.secondaryDays)){
     const d=new Date(L.date+"T12:00:00");
@@ -951,6 +978,7 @@ function recipeSection(r,key){
           <label class="fld"><span>Hop utilisation (%)</span><input type="number" step="1" data-e="hopUtilPct" value="${eq.hopUtilPct}"></label>
           <label class="fld"><span>Mash tun capacity (${vLbl()})</span><input type="number" step="0.5" data-e="tunGal" data-conv="v" value="${vOut(eq.tunGal)}" placeholder="0 = no check"></label>
           <label class="fld"><span>HLT to mash tun loss (${tLbl()})</span><input type="number" step="1" data-e="hltLossF" data-conv="t2" value="${rnd(isMetric()?num(eq.hltLossF)*5/9:num(eq.hltLossF),1)}" placeholder="0"></label>
+          <label class="fld"><span>Mash tun heat capacity (qt of water)</span><input type="number" step="0.5" data-e="tunThermalQt" value="${num(eq.tunThermalQt)}" placeholder="0 = ignore the tun"></label>
         </div></div></div>`;
   }
   if(key==="fermentables") return `<div class="panel"><div class="panel-head"><h2>Fermentables</h2>
@@ -977,8 +1005,8 @@ function recipeSection(r,key){
         <label class="fld" style="margin-bottom:10px"><span>Schedule name here</span><input data-m="name" value="${esc(m.name)}"></label>
         <div class="cols">
           <label class="fld"><span>Grain temp (${tLbl()})</span><input type="number" step="1" data-m="grainTempF" data-conv="t" value="${tOut(m.grainTempF)}"></label>
+          <label class="fld"><span>Mash tun temp (${tLbl()})</span><input type="number" step="1" data-m="tunTempF" data-conv="t" value="${tOut(m.tunTempF===undefined?68:m.tunTempF)}"></label>
           <label class="fld"><span>Thickness (${isMetric()?"L/kg":"qt/lb"})</span><input type="number" step="0.05" data-m="thickQtLb" data-conv="thick" value="${thickOut(m.thickQtLb)}"></label>
-          <label class="fld"><span>Infusion water (${tLbl()})${(m.steps||[]).length>1?"":" — unused"}</span><input type="number" step="1" data-m="infuseTempF" data-conv="t" value="${tOut(m.infuseTempF||212)}"></label>
           <label class="fld"><span>Sparge temp (${tLbl()})</span><input type="number" step="1" data-m="spargeTempF" data-conv="t" value="${tOut(m.spargeTempF)}"></label>
         </div>
         <div class="tablewrap" style="margin-top:12px" id="tbl-m">${mashTable(r)}</div>
@@ -1190,7 +1218,7 @@ function mashTable(r){
     <td class="rowtools"><button class="btn btn-quiet btn-sm" data-rms="${s.id}">✕</button></td></tr>`).join("")+`</tbody></table>`;
 }
 
-function gauge(label,val,lo,hi,fmt,unit,key,live){
+function gauge(label,val,lo,hi,fmt,unit,key,live,hint){
   const v=isFinite(val)?val:0;
   let d0,d1;
   if(lo!=null){
@@ -1210,6 +1238,7 @@ function gauge(label,val,lo,hi,fmt,unit,key,live){
     <span class="gauge-val"${key?` data-gval="${key}"`:""}>${fmt(v)}</span><span class="gauge-range">${unit||""}</span></div>
     <div class="track">${band}${tick}</div>
     ${lo!=null?`<div class="gauge-range" style="margin-top:4px">in style: ${fmt(lo)}–${fmt(hi)}</div>`:""}
+    ${hint?`<div class="gauge-range" style="margin-top:3px">${esc(hint)}</div>`:""}
     ${slider}</div>`;
 }
 function statKV(r,c){
@@ -1227,11 +1256,16 @@ function refreshStats(){
   const c=calc(r), st=styleOf(r.style);
   const g3=v=>v.toFixed(3),g1=v=>v.toFixed(1),g0=v=>String(Math.round(v));
   /* Targets are draggable wherever the recipe can be edited. */
-  const live = !isLocked() && !(S.tab==="recipes"&&S.recipeView!=="edit") &&
+  const editable = !isLocked() && !(S.tab==="recipes"&&S.recipeView!=="edit") &&
                (r.fermentables||[]).some(f=>num(f.lb)>0);
+  const live = editable && !!S.solveOpen;
   document.getElementById("stats").innerHTML=
     `<div class="beerbar" style="background:${srmColor(c.srm)}"><span>SRM ${c.srm.toFixed(1)}</span><span>${esc(r.style||"no style")}</span></div>
-     ${live?`<div class="inline" style="margin-top:12px">
+     ${editable?`<div class="inline" style="margin-top:12px">
+       <button class="btn btn-sm fix" data-act="solve-toggle"
+         style="${live?"border-color:var(--accent);background:var(--accent-soft)":""}">${live?"Done adjusting":"Adjust targets"}</button>
+     </div>`:""}
+     ${live?`<div class="inline" style="margin-top:8px">
        <button class="btn btn-sm fix" data-balmode="spread"
          style="${(S.balMode||"spread")==="spread"?"border-color:var(--accent);background:var(--accent-soft)":""}">Scale the bill</button>
        <button class="btn btn-sm fix" data-balmode="base"
@@ -1241,12 +1275,14 @@ function refreshStats(){
      ${gauge("Original gravity",c.og,st&&st[1],st&&st[2],g3,"","og",live)}
      ${gauge("Final gravity",c.fg,st&&st[3],st&&st[4],g3,"","fg",false)}
      ${gauge("Alcohol",c.abv,st&&st[9],st&&st[10],g1,"% ABV","abv",live)}
-     ${gauge("Bitterness",c.ibu,st&&st[5],st&&st[6],g0,"IBU","ibu",live&&(r.hops||[]).length>0)}
-     ${gauge("Colour",c.srm,st&&st[7],st&&st[8],g1,"SRM","srm",live&&(r.fermentables||[]).length>1)}</div>
+     ${gauge("Bitterness",c.ibu,st&&st[5],st&&st[6],g0,"IBU","ibu",live&&(r.hops||[]).length>0,
+       live?"follows gravity \u2014 the same hops give less in a denser wort":"")}
+     ${gauge("Colour",c.srm,st&&st[7],st&&st[8],g1,"SRM","srm",false)}</div>
      <dl class="kv" id="statkv" style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">${statKV(r,c)}</dl>
      ${c.grainLb>0&&c.dp<30?`<div class="note" style="color:var(--warn)">Diastatic power under 30 °Lintner — this grain bill may not fully convert on its own.</div>`:""}
-     ${live?`<div class="note">Drag a target and the grain or hops move to meet it. Gravity scales the bill,
-        bitterness scales the hops, colour shifts weight between your palest and darkest malt.</div>`:""}`;
+     ${live?`<div class="note">Drag a target and the grain or hops move to meet it. Bitterness drifts when you
+        move gravity because that is what happens in the kettle; drag it back and the hops are rescaled.
+        Watch the bitterness ratio below, which holds the relationship the beer is actually balanced on.</div>`:""}`;
   const totLb=(r.fermentables||[]).reduce((a,f)=>a+num(f.lb),0);
   const gb=document.getElementById("grainbill"); if(gb) gb.textContent=`${wOut(totLb)} ${wLbl()} total`;
   (r.fermentables||[]).forEach(f=>{ const cell=document.querySelector(`[data-pct="${f.id}"]`);
@@ -1340,6 +1376,7 @@ function equipBody(p){
       ${f("hopUtilPct","Hop utilisation (%)",null,"1")}
       ${f("tunGal","Mash tun capacity ("+vLbl()+")","v","0.5")}
       ${f("hltLossF","HLT to mash tun loss ("+tLbl()+")","t2","1")}
+      ${f("tunThermalQt","Mash tun heat capacity (qt of water)",null,"0.5")}
     </div></div>`;
 }
 function mashBody(p){
@@ -1358,8 +1395,8 @@ function mashBody(p){
     <label class="fld" style="margin-bottom:10px"><span>Name</span><input data-mp="${p.id}:name" value="${esc(p.name)}"></label>
     <div class="cols">
       ${f("grainTempF","Grain temp ("+tLbl()+")","t")}
+      ${f("tunTempF","Mash tun temp ("+tLbl()+")","t")}
       ${f("thickQtLb","Thickness ("+(isMetric()?"L/kg":"qt/lb")+")","thick","0.05")}
-      ${f("infuseTempF","Infusion water ("+tLbl()+")","t")}
       ${f("spargeTempF","Sparge temp ("+tLbl()+")","t")}
     </div>
     <h3 class="subhead">Steps</h3>
@@ -1456,12 +1493,20 @@ function solveSRM(r,target){
   dark.lb=rnd(num(dark.lb)+t,4);
 }
 function solveTarget(r,key,v){
+  /* Moving gravity moves bitterness, and that is not an artefact: a denser wort draws
+     less from the same hops, so the same additions give fewer IBU. The hop weights are
+     left alone and the number is allowed to tell the truth. */
   if(key==="og") solveOG(r,v);
   else if(key==="abv") solveABV(r,v);
   else if(key==="ibu") solveIBU(r,v);
-  else if(key==="srm") solveSRM(r,v);
 }
 /* Repaint without touching the slider under the user's finger. */
+/* The batch's target gravity is whatever its own recipe now predicts. */
+function syncTarget(){
+  if(S.tab!=="batches"||!S.openBatch) return;
+  const b=curB(); if(!b||!b.recipe) return;
+  b.targetOG=rnd(calc(b.recipe).og,3);
+}
 function patchStats(){
   const r=activeRecipe(); if(!r) return;
   const c=calc(r);
@@ -1492,6 +1537,111 @@ function patchStats(){
     if(cell) cell.textContent=(c.hopIbu[h.id]||0).toFixed(1); });
 }
 
+
+/* ---------- BeerSmith session data (.bsmx) ---------- */
+/* BeerXML has no tags for most of what the Session Data dialog holds, so those figures
+   only exist in BeerSmith's own file. Volumes there are fluid ounces, and every value
+   carries a _SET flag: 0 means BeerSmith is showing its own estimate, not something
+   that was measured. Only the ones actually entered are taken. */
+const BSMX_OZ_PER_GAL=128;
+/* Names in this file are escaped: "------&gt;" has to come back as "------>" or it
+   will never match the batch it belongs to. */
+function unent(v){
+  return String(v).replace(/&(amp|lt|gt|quot|apos|#39);/g,(m,e)=>
+    ({amp:"&",lt:"<",gt:">",quot:'"',apos:"'","#39":"'"}[e]));
+}
+function bsmxField(block,tag){
+  const m=block.match(new RegExp("<"+tag+">([\\s\\S]*?)</"+tag+">"));
+  return m?unent(m[1].trim()):null;
+}
+function bsmxSet(block,tag){ return bsmxField(block,tag+"_SET")==="1"; }
+function bsmxNum(block,tag){ const v=bsmxField(block,tag); const n=parseFloat(v); return isFinite(n)?n:null; }
+function parseBsmx(text){
+  if(text.indexOf("<F_R_NAME>")<0) throw new Error("that does not look like a BeerSmith .bsmx file");
+  const blocks=text.split(/(?=<Recipe>)/).filter(b=>b.indexOf("<F_R_NAME>")>-1);
+  return blocks.map(b=>{
+    const take=(tag,conv)=>{ if(!bsmxSet(b,tag)) return null;
+      const n=bsmxNum(b,tag); return n==null?null:(conv?conv(n):n); };
+    const gal=n=>rnd(n/BSMX_OZ_PER_GAL,3);
+    return {
+      name: bsmxField(b,"F_R_NAME")||"",
+      date: (bsmxField(b,"F_R_DATE")||"").slice(0,10),
+      intoFermGal: take("F_R_VOLUME_MEASURED",gal),
+      preBoilGal:  take("F_R_BOIL_VOL_MEASURED",gal),
+      preBoilSG:   take("F_R_OG_BOIL_MEASURED",n=>rnd(n,3)),
+      postMashSG:  take("F_R_OG_MASH_MEASURED",n=>rnd(n,3)),
+      firstRunSG:  take("F_R_RUNNING_GRAVITY",n=>rnd(n,3)),
+      mashPH:      take("F_R_MASH_PH",n=>rnd(n,2)),
+      spargePH:    take("F_R_RUNOFF_PH",n=>rnd(n,2)),
+      og:          take("F_R_OG_MEASURED",n=>rnd(n,3)),
+      fg:          take("F_R_FG_MEASURED",n=>rnd(n,3))
+    };
+  });
+}
+/* Match on the name, ignoring punctuation and case, as the export and the library
+   drift apart over the years. */
+const bsmxKey=s2=>String(s2||"").toLowerCase().replace(/[^a-z0-9]+/g," ").trim();
+function applyBsmx(rows){
+  const by={};
+  S.batches.forEach(b=>{ const k=bsmxKey(b.name); if(!by[k]) by[k]=b; });
+  let touched=0, filled=0, unmatched=[];
+  rows.forEach(row=>{
+    const b=by[bsmxKey(row.name)];
+    if(!b){ if(row.og!=null||row.intoFermGal!=null) unmatched.push(row.name); return; }
+    b.session=b.session||SESSION_BLANK();
+    let any=false;
+    ["intoFermGal","preBoilGal","preBoilSG","postMashSG","firstRunSG","mashPH","spargePH"].forEach(k=>{
+      if(row[k]!=null && (b.session[k]===""||b.session[k]==null)){ b.session[k]=row[k]; any=true; filled++; }
+    });
+    if(row.og!=null && !b.actualOG){ b.actualOG=row.og; any=true; filled++; }
+    if(row.fg!=null && !b.actualFG){ b.actualFG=row.fg; any=true; filled++; }
+    if(any) touched++;
+  });
+  if(touched) save("batches");
+  return {touched, filled, unmatched, total:rows.length};
+}
+
+
+/* ---------- taking a batch out of stock ---------- */
+/* What the recipe calls for comes off the shelf once, and goes back if you undo it.
+   Weights convert; a packet of yeast only matches a packet. */
+const W_IN_G={lb:453.59237,kg:1000,oz:28.349523,g:1};
+function convQty(qty,from,to){
+  from=String(from||"").toLowerCase(); to=String(to||"").toLowerCase();
+  if(from===to) return qty;
+  const f=W_IN_G[from], t=W_IN_G[to];
+  return (f&&t)?qty*f/t:null;
+}
+function takeStock(b){
+  const needs=shortNeeds(b.recipe||BLANK());
+  const rows=[], missing=[], short=[];
+  needs.forEach(n=>{
+    if(!(n.qty>0)) return;
+    const m=stockFor(n.name,n.cat);
+    if(!m){ missing.push(n.name); return; }
+    let q=convQty(n.qty,n.u,m.row.unit||n.u);
+    if(q==null){ missing.push(n.name+" (units do not match)"); return; }
+    /* Take what is there rather than driving the shelf negative, and record exactly
+       what came off so putting it back lands on the number it started from. */
+    const have=num(m.row.qty);
+    if(q>have){ short.push(n.name); q=Math.max(0,have); }
+    q=rnd(q,4);
+    if(q<=0) return;
+    m.row.qty=rnd(have-q,4);
+    rows.push({id:m.row.id,qty:q});
+  });
+  b.stockTaken={at:new Date().toISOString().slice(0,10),rows};
+  save("inventory"); save("batches");
+  return {taken:rows.length,missing,short};
+}
+function returnStock(b){
+  const t=b.stockTaken; if(!t) return 0;
+  (t.rows||[]).forEach(x=>{ const row=S.inventory.find(i=>i.id===x.id);
+    if(row) row.qty=rnd(num(row.qty)+x.qty,4); });
+  b.stockTaken=null; save("inventory"); save("batches");
+  return (t.rows||[]).length;
+}
+
 /* ---------- batches ---------- */
 function batchList(){
   const q=normName(S.batQ||"");
@@ -1513,6 +1663,7 @@ function batchList(){
   }).join("");
   return `<div class="panel"><div class="panel-head"><h2>Batches</h2>
     <button class="btn btn-sm" data-act="import">Import BeerXML</button>
+    <button class="btn btn-sm" data-act="import-bsmx">Session data (.bsmx)</button>
     <button class="btn btn-sm" data-act="export-all">Export all</button>
     <button class="btn btn-primary" data-act="new-batch">New batch</button></div>
     <div class="panel-body">
@@ -1588,15 +1739,19 @@ function billTable(r){
       ${grp("Miscellaneous","water salts, finings, spices, kit","add-x")}${misc||none("Nothing yet.")}
     </tbody></table></div></div>`;
 }
-function batchRecipe(b){
-  const r=b.recipe, eq=r.equipment||EQ_DEFAULT();
+function equipPanel(r){
+  const eq=r.equipment||EQ_DEFAULT();
   const eqOpts=`<option value="">Load a different profile…</option>`+S.equipProfiles.map(p=>
     `<option value="${p.id}">${esc(p.name)}</option>`).join("");
   return `<div class="panel"><div class="panel-head"><h2>Equipment</h2>
       <span class="small muted" style="flex:1">${esc(eq.name||"—")}</span>
       <select data-loadeq style="max-width:220px">${eqOpts}</select></div>
-      <div class="panel-body small muted">Volumes, losses and efficiency live on the profile, and in Brew session once you have measured them.</div></div>
-    ${billTable(r)}
+      <div class="panel-body small muted">${vOut(eq.batchGal)} ${vLbl()} \u00b7 ${rnd(num(eq.effPct),1)}% efficiency
+        \u00b7 ${vOut(eq.evapGalHr)} ${vLbl()}/hr boil-off. The full profile is on the Profiles tab.</div></div>`;
+}
+function batchRecipe(b){
+  const r=b.recipe;
+  return `${billTable(r)}
     ${recipeSection(r,"yeast")}`;
 }
 function batchSection(b){
@@ -1621,7 +1776,7 @@ function batchSection(b){
       ${batchRecipe(b)}`;
   }
   if(k==="mash") return recipeSection(b.recipe,"mash");
-  if(k==="session") return sessionPanel(b);
+  if(k==="session") return equipPanel(b.recipe)+sessionPanel(b);
   if(k==="ferment"){
     const rows=(b.readings||[]).slice().sort((x,y)=>(x.date||"").localeCompare(y.date||""));
     return `<div class="panel"><div class="panel-head"><h2>Fermentation log</h2>
@@ -1653,6 +1808,8 @@ function batchEditor(){
       <span style="margin-left:auto"></span>
       <button class="btn btn-sm btn-primary" data-act="timer">Brew day</button>
       <button class="btn btn-sm" data-act="split">Split batch</button>
+      <button class="btn btn-sm" data-act="${b.stockTaken?"stock-return":"stock-take"}">${
+        b.stockTaken?"Return to stock":"Take from stock"}</button>
       <button class="btn btn-sm" data-act="export-batch">Export</button>
       ${base?`<button class="btn btn-sm" data-act="reset-base">Reset to base</button>`:
              `<button class="btn btn-sm" data-act="to-base">Save as base recipe</button>`}
@@ -1663,7 +1820,8 @@ function batchEditor(){
         <label class="fld"><span>Batch</span><input data-b="name" value="${esc(b.name)}"
           style="font-family:'Bricolage Grotesque',sans-serif;font-weight:700;font-size:18px"></label>
         <p class="muted small" style="margin:6px 0 0">${esc(b.brewDate||"no date")} \u00b7 ${esc(b.status)}${
-          b.baseRecipeName?" \u00b7 from "+esc(b.baseRecipeName):""}</p>
+          b.baseRecipeName?" \u00b7 from "+esc(b.baseRecipeName):""}${
+          b.stockTaken?` \u00b7 taken from stock ${esc(b.stockTaken.at)}`:""}</p>
       </div></div>
     ${secBar(BATCH_SECS,S.secB||"batch","secb")}
     ${batchSection(b)}
@@ -1982,7 +2140,7 @@ function doSplit(){
    taking the newer of each pair by id, and honouring a tombstone newer than the record
    it refers to. Nothing is overwritten wholesale, so two devices can both have worked
    offline and neither loses anything but the field the other changed later. */
-const APP_VERSION="3.7.0";
+const APP_VERSION="3.11.0";
 const SYNC_KEYS=["recipes","batches","inventory","equipProfiles","mashProfiles"];
 
 /* A record is compared ignoring _u, with keys in a fixed order, so a trip through
@@ -2298,7 +2456,7 @@ function syncView(){
 /* ===================== brew session ===================== */
 /* What actually happened on the day, beside what the recipe predicted.
    Gravity samples are corrected for temperature before anything is derived from them. */
-const SESSION_BLANK=()=>({calTempF:60,primaryDays:'',primaryTempF:'',secondaryDays:'',secondaryTempF:'',ageDays:'',bsEff:'',strikeTempF:"",mashInTempF:"",mashOutTempF:"",
+const SESSION_BLANK=()=>({calTempF:60,primaryDays:'',primaryTempF:'',secondaryDays:'',secondaryTempF:'',ageDays:'',bsEff:'',tertiaryDays:'',ageTempF:'',stages:'',carbUsed:'',carbVols:'',mashPH:'',spargePH:'',postMashSG:'',strikeTempF:"",mashInTempF:"",mashOutTempF:"",
   firstRunSG:"",preBoilGal:"",preBoilSG:"",preBoilTempF:"",postBoilGal:"",intoFermGal:"",
   ogTempF:"",pitchTempF:"",pitchedAt:"",log:[]});
 const hydCorr=T=>1.00130346-1.34722124e-4*T+2.04052596e-6*T*T-2.32820948e-9*T*T*T;
@@ -2364,7 +2522,9 @@ function sessionPanel(b){
       </div>
       <h3 class="subhead">Mash</h3>
       <div class="cols">${ft("strikeTempF","Strike water")}${ft("mashInTempF","Mash in, hit")}
-        ${ft("mashOutTempF","Mash out, ended")}${f("firstRunSG","First runnings SG","0.001")}</div>
+        ${ft("mashOutTempF","Mash out, ended")}${f("postMashSG","Post-mash gravity","0.001")}
+        ${f("firstRunSG","First runnings SG","0.001")}${f("mashPH","Mash pH","0.01")}
+        ${f("spargePH","Sparge runoff pH","0.01")}</div>
       <h3 class="subhead">Lauter and boil</h3>
       <div class="cols">${fv("preBoilGal","Pre-boil volume")}${f("preBoilSG","Pre-boil gravity","0.001")}
         ${ft("preBoilTempF","Sample temp")}${fv("postBoilGal","Post-boil volume")}</div>
@@ -2399,7 +2559,10 @@ function paintSession(){
    +(se2.bsEff?row("Efficiency on record",`${se2.bsEff}% <span class="muted">as imported</span>`):"")
    +(se2.primaryDays?row("Primary",`${se2.primaryDays} days at ${tOut(num(se2.primaryTempF))} ${tLbl()}`):"")
    +(se2.secondaryDays?row("Secondary",`${se2.secondaryDays} days at ${tOut(num(se2.secondaryTempF))} ${tLbl()}`):"")
-   +(se2.ageDays?row("Conditioned",`${se2.ageDays} days`):"")
+   +(se2.tertiaryDays?row("Tertiary",`${se2.tertiaryDays} days`):"")
+   +(se2.ageDays?row("Conditioned",`${se2.ageDays} days${se2.ageTempF?" at "+tOut(num(se2.ageTempF))+" "+tLbl():""}`):"")
+   +(se2.carbUsed?row("Carbonation",esc(se2.carbUsed)):"")
+   +(num(se2.mashPH)?row("Mash pH",`${se2.mashPH}${num(se2.spargePH)?" · sparge runoff "+se2.spargePH:""}`):"")
    +(s2.evap!=null?row("Actual boil-off",`${vOut(s2.evap)} ${vLbl()}/hr <span class="muted">(profile ${vOut(num(eq.evapGalHr))})</span>`):"")
    || `<dt class="muted">Fill in a gravity and a volume and the efficiencies work themselves out.</dt><dd></dd>`;
 }
@@ -2587,6 +2750,12 @@ const filein=document.getElementById("filein");
 filein.addEventListener("change",async()=>{
   const f=filein.files&&filein.files[0]; if(!f) return;
   try{
+    if(S.importTo==="bsmx"){
+      const res=applyBsmx(parseBsmx(await f.text()));
+      flash(`${res.filled} figure${res.filled===1?"":"s"} added to ${res.touched} batch${res.touched===1?"":"es"}`+
+        (res.unmatched.length?`, ${res.unmatched.length} unmatched`:"")+".");
+      filein.value=""; render(); return;
+    }
     if(S.importTo==="backup"){
       restoreDoc(JSON.parse(await f.text()));
       flash("Backup restored."); filein.value=""; render(); return;
@@ -2623,6 +2792,7 @@ function appClick(e){
     setTbl("tbl-m",mashTable(r));refreshStats();return;}
   if(t.dataset.rmr&&b){b.readings=b.readings.filter(x=>x.id!==t.dataset.rmr);save("batches");render();return;}
   if(t.dataset.rmi){S.inventory=S.inventory.filter(x=>x.id!==t.dataset.rmi);save("inventory");render();return;}
+  if(t.dataset.act==="solve-toggle"){ S.solveOpen=!S.solveOpen; refreshStats(); return; }
   if(t.dataset.balmode){ S.balMode=t.dataset.balmode; save("settings"); render(); return; }
   if(t.dataset.seco){ navKeep(()=>{S.secO=t.dataset.seco;}); return; }
   if(t.dataset.secr){ navKeep(()=>{S.secR=t.dataset.secr;}); return; }
@@ -2679,6 +2849,7 @@ function appClick(e){
   else if(a==="read-mode"){nav(()=>{S.recipeView="read";});}
   else if(a==="backb"){nav(()=>{S.openBatch=null;});}
   else if(a==="import"){S.importTo=S.tab;filein.click();}
+  else if(a==="import-bsmx"){S.importTo="bsmx";filein.click();}
   else if(a==="export-all"){
     const list=S.tab==="batches"?S.batches.filter(x=>x.recipe).map(x=>x.recipe):S.recipes;
     if(!list.length){flash("Nothing to export.");return;}
@@ -2715,6 +2886,17 @@ function appClick(e){
     if(s2.kettleEff!=null) eq.effPct=rnd(s2.kettleEff,1);
     if(s2.evap!=null&&s2.evap>0) eq.evapGalHr=rnd(s2.evap,3);
     save("batches"); flash("Equipment updated from what you measured."); render(); }
+  else if(a==="stock-take"&&b){
+    confirmBox("Take from stock","Everything this batch calls for comes off your inventory. You can put it back.","Take",
+      ()=>{ const r2=takeStock(b);
+        flash(`${r2.taken} item${r2.taken===1?"":"s"} taken`
+          +(r2.short.length?`, ${r2.short.length} short`:"")
+          +(r2.missing.length?`, ${r2.missing.length} not in stock`:"")+".");
+        render(); });
+  }
+  else if(a==="stock-return"&&b){
+    const n=returnStock(b); flash(`${n} item${n===1?"":"s"} returned to stock.`); render();
+  }
   else if(a==="split"&&b){ if(b.parentBatchId){ flash("This is already one part of a split."); return; }
     if((b.splitInto||[]).length){ flash("This batch is already split."); return; }
     S.splitRows=null; splitDialog(); }
@@ -2804,6 +2986,7 @@ app.addEventListener("input",e=>{
     const p=S.mashProfiles.find(x=>x.id===el.value); if(p&&r){
       r.mash=JSON.parse(JSON.stringify(p)); delete r.mash.id;
       r.mash.steps=r.mash.steps.map(s=>Object.assign({},s,{id:uid()})); save(K); render(); } return; }
+  if((el.dataset.p||el.dataset.e||el.dataset.m||el.dataset.s||el.dataset.x)&&S.tab==="batches") setTimeout(syncTarget,0);
   if(el.dataset.p&&r){
     const parts=el.dataset.p.split(":");
     if(parts.length===1){ r[parts[0]]=(el.type==="number")?conv(el,num(el.value)):el.value; }
@@ -2880,7 +3063,7 @@ app.addEventListener("input",e=>{
   if(el.dataset.solve&&r){
     if(isLocked()) return;
     solveTarget(r,el.dataset.solve,parseFloat(el.value));
-    save(K); patchStats(); return; }
+    syncTarget(); save(K); patchStats(); return; }
   if(el.dataset.t){ runAllTools(); return; }
 });
 
