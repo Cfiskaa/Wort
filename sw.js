@@ -1,6 +1,6 @@
 /* Wort service worker — cache-first shell so the app opens with no network.
    Bump CACHE on every release; old caches are dropped on activate. */
-const CACHE = "wort-v3.2.1";
+const CACHE = "wort-v3.5.0";
 const SHELL = [
   "./", "./index.html", "./manifest.webmanifest",
   "./icons/icon-192.png", "./icons/icon-512.png", "./icons/icon-maskable-512.png"
