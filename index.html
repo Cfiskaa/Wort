@@ -188,6 +188,10 @@ fieldset[disabled] input,fieldset[disabled] select,fieldset[disabled] textarea{b
 }
 input[type="range"].balrange{width:100%; margin:8px 0 0; height:26px; accent-color:var(--accent);
   background:transparent; padding:0}
+.itbl.lbl td[data-l]::before{content:attr(data-l); display:block; font-size:11.5px; color:var(--muted); margin-bottom:3px; line-height:1.2}
+.itbl tr.grp td{border-top:1px solid var(--line-strong); background:var(--surface-2); padding:8px 6px;
+  display:flex; gap:10px; align-items:center}
+.itbl tr.grp td::before{content:none}
 .secbar{display:flex; gap:3px; overflow-x:auto; -webkit-overflow-scrolling:touch; scrollbar-width:none}
 .secbar::-webkit-scrollbar{display:none}
 .secbar .tab{white-space:nowrap}
@@ -540,9 +544,15 @@ async function saveFile(filename,text,mime){
 
 /* ========================= BeerXML ========================= */
 const kid=(el,tag)=>{for(const c of el.children){if(c.tagName.toUpperCase()===tag) return c;} return null;};
-const kidTxt=(el,tag,def)=>{const n=kid(el,tag); return n&&n.textContent.trim()!==""?n.textContent.trim():(def!==undefined?def:"");};
+/* BeerSmith template entries carry unfilled placeholders like $name and $notes.
+   They are not values, so treat them as absent. */
+const isPlaceholder=v=>/^\$[A-Za-z_][\w]*$/.test(String(v||"").trim());
+const kidTxt=(el,tag,def)=>{const n=kid(el,tag);
+  const v=n?n.textContent.trim():"";
+  return (v!==""&&!isPlaceholder(v))?v:(def!==undefined?def:"");};
 const kidNum=(el,tag,def)=>{const v=kidTxt(el,tag,""); const n=parseFloat(v); return isFinite(n)?n:(def||0);};
 const kidsOf=(el,wrapTag,itemTag)=>{const w=kid(el,wrapTag); if(!w) return []; return [...w.children].filter(c=>c.tagName.toUpperCase()===itemTag);};
+let SKIPPED=0;
 const HOP_USE_IN={"BOIL":"Boil","DRY HOP":"Dry hop","FIRST WORT":"First wort","AROMA":"Whirlpool","MASH":"Whirlpool","WHIRLPOOL":"Whirlpool"};
 const HOP_USE_OUT={"Boil":"Boil","Dry hop":"Dry Hop","First wort":"First Wort","Whirlpool":"Aroma"};
 const FERM_KIND_IN=t=>{t=(t||"").toLowerCase();
@@ -554,7 +564,12 @@ function importBeerXML(text){
   if(doc.getElementsByTagName("parsererror").length) throw new Error("That file isn’t valid XML.");
   const nodes=[...doc.getElementsByTagName("RECIPE")];
   if(!nodes.length) throw new Error("No <RECIPE> found. Export from BeerSmith as BeerXML and try again.");
-  return nodes.map(n=>{
+  /* A recipe with nothing in it is a template, not a recipe. */
+  const real=nodes.filter(n=>kidsOf(n,"FERMENTABLES","FERMENTABLE").length
+                           ||kidsOf(n,"HOPS","HOP").length
+                           ||kidsOf(n,"YEASTS","YEAST").length);
+  SKIPPED=nodes.length-real.length;
+  return real.map(n=>{
     const r=BLANK();
     r.name=kidTxt(n,"NAME","Imported recipe");
     r.brewer=kidTxt(n,"BREWER","");
@@ -871,6 +886,9 @@ function newBatchFrom(base,name){
   save("batches"); nav(()=>{S.tab="batches"; S.openBatch=S.batches[S.batches.length-1].id;});
 }
 
+/* Nothing in it, nothing written on it: safe to offer for removal. */
+const isEmptyRecipe=r=>!(r.fermentables||[]).length && !(r.hops||[]).length
+  && !(r.yeasts||[]).length && !(r.miscs||[]).length && !String(r.notes||"").trim();
 function recipeList(){
   const q=normName(S.recQ||"");
   const list=S.recipes.filter(r=>!q||normName(r.name).indexOf(q)>-1||normName(r.style).indexOf(q)>-1);
@@ -892,6 +910,10 @@ function recipeList(){
       ${S.recipes.length?`<div class="cardlist">${cards}</div>`:
       `<div class="empty"><p>No base recipes yet. Start one, or bring your BeerSmith library across with Import BeerXML.</p>
       <button class="btn btn-primary" data-act="new-recipe">New recipe</button></div>`}
+      ${(function(){ const e=S.recipes.filter(isEmptyRecipe);
+        return e.length?`<div class="note" style="color:var(--warn);display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <span style="flex:1;min-width:180px">${e.length} recipe${e.length===1?" has":"s have"} no ingredients or notes \u2014 usually BeerSmith templates that came in with an import.</span>
+          <button class="btn btn-sm" data-act="purge-empty">Remove ${e.length===1?"it":"them"}</button></div>`:"";})()}
       <div class="note">This is the reference library. Lock a recipe once it’s settled — brewing it copies it into a batch you can change freely, and the original stays untouched.</div>
       </div><div class="syncline" id="syncline"></div></div>`;
 }
@@ -1515,9 +1537,57 @@ function splitTabs(b){
       kids.map(k=>tab(k,k.splitLabel||k.name)).join("")}</nav>
     <span class="small muted">${kids.length} parts, one wort</span></div>`;
 }
-const BATCH_SECS=[["batch","Batch"],["session","Brew session"],["ferment","Fermentation"],["bnotes","Notes"]];
+const BATCH_SECS=[["batch","Batch"],["mash","Mash"],["session","Brew session"],["ferment","Fermentation"],["bnotes","Notes"]];
 /* The recipe sits inside Batch, grouped by category in the order of a brew day:
    what goes in the tun, the schedule that runs it, then the boil, then the pitch. */
+/* Fermentables, hops and misc read as one list on the batch screen: same shape, one
+   place to look, in the order they go in. Each cell keeps its own label so the mixed
+   row types stay legible at any width. */
+function billTable(r){
+  const c=calc(r);
+  const totLb=(r.fermentables||[]).reduce((a,f)=>a+num(f.lb),0);
+  const grp=(label,sub,act)=>`<tr class="grp"><td colspan="7">
+      <span style="flex:1;min-width:0"><b>${label}</b>${sub?`<span class="muted small" style="margin-left:8px">${sub}</span>`:""}</span>
+      <button class="btn btn-sm" data-act="${act}">Add</button></td></tr>`;
+  const none=t=>`<tr class="row"><td colspan="7" class="muted small">${t}</td></tr>`;
+  const ferm=(r.fermentables||[]).map(f=>`<tr class="row">
+      <td data-l="Fermentable"><input list="dl-ferm" data-p="f:${f.id}:name" value="${esc(f.name)}"></td>
+      <td class="num" data-l="${wLbl()}" style="width:86px"><input type="number" step="0.01" data-p="f:${f.id}:lb" data-conv="w" value="${wOut(f.lb)}"></td>
+      <td class="num muted" data-l="%" data-pct="${f.id}" style="width:46px">${totLb>0?Math.round(num(f.lb)/totLb*100):0}</td>
+      <td class="num" data-l="PPG" style="width:62px"><input type="number" step="1" data-p="f:${f.id}:ppg" value="${rnd(f.ppg,1)}"></td>
+      <td class="num" data-l="\u00b0L" style="width:66px"><input type="number" step="0.5" data-p="f:${f.id}:lovibond" value="${rnd(f.lovibond,1)}"></td>
+      <td data-l="Type" style="width:92px"><select data-p="f:${f.id}:kind">${["grain","extract","sugar"].map(k=>
+        `<option${f.kind===k?" selected":""}>${k}</option>`).join("")}</select></td>
+      <td class="rowtools"><button class="btn btn-quiet btn-sm" data-rm="f:${f.id}">\u2715</button></td></tr>`).join("");
+  const hops=(r.hops||[]).map(h=>`<tr class="row">
+      <td data-l="Hop"><input list="dl-hop" data-p="h:${h.id}:name" value="${esc(h.name)}"></td>
+      <td class="num" data-l="${hLbl()}" style="width:86px"><input type="number" step="0.05" data-p="h:${h.id}:oz" data-conv="h" value="${hOut(h.oz)}"></td>
+      <td class="num" data-l="AA %" style="width:64px"><input type="number" step="0.1" data-p="h:${h.id}:aa" value="${rnd(h.aa,1)}"></td>
+      <td data-l="Form" style="width:86px"><select data-p="h:${h.id}:form">${HOP_FORMS.map(u=>
+        `<option${(h.form||"Pellet")===u?" selected":""}>${u}</option>`).join("")}</select></td>
+      <td data-l="Use" style="width:112px"><select data-p="h:${h.id}:use">${["Boil","First wort","Whirlpool","Dry hop"].map(u=>
+        `<option${h.use===u?" selected":""}>${u}</option>`).join("")}</select></td>
+      <td class="num" data-l="Min \u00b7 IBU" style="width:96px"><input type="number" step="1" data-p="h:${h.id}:min" value="${num(h.min)}">
+        <span class="small muted" data-ibu="${h.id}" style="display:block;text-align:right">${(c.hopIbu[h.id]||0).toFixed(1)}</span></td>
+      <td class="rowtools"><button class="btn btn-quiet btn-sm" data-rm="h:${h.id}">\u2715</button></td></tr>`).join("");
+  const misc=(r.miscs||[]).map(x=>`<tr class="row">
+      <td data-l="Item"><input list="dl-misc" data-x="${x.id}:name" value="${esc(x.name)}"></td>
+      <td class="num" data-l="Amount" style="width:86px"><input type="number" step="0.1" data-x="${x.id}:amount" value="${num(x.amount)}"></td>
+      <td data-l="Unit" style="width:72px"><select data-x="${x.id}:unit">${["g","ml","tsp","tbsp","oz","lb","ea"].map(u=>
+        `<option${x.unit===u?" selected":""}>${u}</option>`).join("")}</select></td>
+      <td data-l="Use" style="width:112px"><select data-x="${x.id}:use">${MISC_USES.map(u=>
+        `<option${x.use===u?" selected":""}>${u}</option>`).join("")}</select></td>
+      <td class="num" data-l="Time (min)" style="width:76px"><input type="number" step="1" data-x="${x.id}:time" value="${num(x.time)}"></td>
+      <td data-l="Category" style="width:104px"><input data-x="${x.id}:cat" value="${esc(x.cat||"")}"></td>
+      <td class="rowtools"><button class="btn btn-quiet btn-sm" data-rmx="${x.id}">\u2715</button></td></tr>`).join("");
+  return `<div class="panel"><div class="panel-head"><h2>Bill</h2>
+      <span class="small muted">in the order it goes in</span></div>
+    <div class="panel-body tablewrap" id="tbl-bill"><table class="itbl lbl"><tbody>
+      ${grp("Fermentables",`${wOut(totLb)} ${wLbl()}`,"add-f")}${ferm||none("Nothing in the grain bill yet.")}
+      ${grp("Hops",`${hOut(c.boilOz+c.dryOz)} ${hLbl()} \u00b7 ${Math.round(c.ibu)} IBU`,"add-h")}${hops||none("No hops.")}
+      ${grp("Miscellaneous","water salts, finings, spices, kit","add-x")}${misc||none("Nothing yet.")}
+    </tbody></table></div></div>`;
+}
 function batchRecipe(b){
   const r=b.recipe, eq=r.equipment||EQ_DEFAULT();
   const eqOpts=`<option value="">Load a different profile…</option>`+S.equipProfiles.map(p=>
@@ -1526,10 +1596,7 @@ function batchRecipe(b){
       <span class="small muted" style="flex:1">${esc(eq.name||"—")}</span>
       <select data-loadeq style="max-width:220px">${eqOpts}</select></div>
       <div class="panel-body small muted">Volumes, losses and efficiency live on the profile, and in Brew session once you have measured them.</div></div>
-    ${recipeSection(r,"fermentables")}
-    ${recipeSection(r,"mash")}
-    ${recipeSection(r,"hops")}
-    ${recipeSection(r,"misc")}
+    ${billTable(r)}
     ${recipeSection(r,"yeast")}`;
 }
 function batchSection(b){
@@ -1553,6 +1620,7 @@ function batchSection(b){
            dry hops, readings and final gravity belong to the parts above.</div></div>` : ""}
       ${batchRecipe(b)}`;
   }
+  if(k==="mash") return recipeSection(b.recipe,"mash");
   if(k==="session") return sessionPanel(b);
   if(k==="ferment"){
     const rows=(b.readings||[]).slice().sort((x,y)=>(x.date||"").localeCompare(y.date||""));
@@ -1914,7 +1982,7 @@ function doSplit(){
    taking the newer of each pair by id, and honouring a tombstone newer than the record
    it refers to. Nothing is overwritten wholesale, so two devices can both have worked
    offline and neither loses anything but the field the other changed later. */
-const APP_VERSION="3.6.0";
+const APP_VERSION="3.7.0";
 const SYNC_KEYS=["recipes","batches","inventory","equipProfiles","mashProfiles"];
 
 /* A record is compared ignoring _u, with keys in a fixed order, so a trip through
@@ -2524,16 +2592,16 @@ filein.addEventListener("change",async()=>{
       flash("Backup restored."); filein.value=""; render(); return;
     }
     const list=importBeerXML(await f.text());
-    const n=list.length;
+    const n=list.length, skipped=SKIPPED;
     if(S.importTo==="batches"){
       list.forEach(r=>{ r.locked=false; const c=calc(r); const L=r._log||{}; delete r._log;
         S.batches.push(batchFromImport(r,c,L)); });
       save("batches"); S.tab="batches"; S.openBatch=null;
-      flash(`Imported ${n} batch${n===1?"":"es"}.`);
+      flash(`Imported ${n} batch${n===1?"":"es"}${skipped?", skipped "+skipped+" empty":""}.`);
     } else {
       list.forEach(r=>{ r.locked=true; S.recipes.push(r); });
       save("recipes"); S.tab="recipes"; S.openRecipe=null;
-      flash(`Imported ${n} recipe${n===1?"":"s"}, locked.`);
+      flash(`Imported ${n} recipe${n===1?"":"s"}, locked${skipped?". Skipped "+skipped+" empty template"+(skipped===1?"":"s"):""}.`);
     }
     render();
   }catch(err){ flash(err.message||"Could not read that file."); }
@@ -2548,9 +2616,9 @@ function appClick(e){
   if(t.dataset.openb){nav(()=>{S.openBatch=t.dataset.openb;});return;}
   if(t.dataset.rm&&r){const[k,id]=t.dataset.rm.split(":");const key={f:"fermentables",h:"hops",y:"yeasts"}[k];
     r[key]=r[key].filter(x=>x.id!==id);save(K);
-    setTbl("tbl-"+k,{f:fermTable,h:hopTable,y:yeastTable}[k](r));refreshStats();return;}
+    setTbl("tbl-"+k,{f:fermTable,h:hopTable,y:yeastTable}[k](r)); if(document.getElementById("tbl-bill")) render();refreshStats();return;}
   if(t.dataset.rmx&&r){r.miscs=r.miscs.filter(x=>x.id!==t.dataset.rmx);save(K);
-    setTbl("tbl-x",miscTable(r));refreshStats();return;}
+    setTbl("tbl-x",miscTable(r)); if(document.getElementById("tbl-bill")) render();refreshStats();return;}
   if(t.dataset.rms&&r){r.mash.steps=r.mash.steps.filter(x=>x.id!==t.dataset.rms);save(K);
     setTbl("tbl-m",mashTable(r));refreshStats();return;}
   if(t.dataset.rmr&&b){b.readings=b.readings.filter(x=>x.id!==t.dataset.rmr);save("batches");render();return;}
@@ -2597,6 +2665,14 @@ function appClick(e){
     const even=rnd(100/S.splitRows.length,1); S.splitRows.forEach(x=>x.pct=even);
     if(S.splitDraw) S.splitDraw(); return; }
   const a=t.dataset.act;
+  if(a==="purge-empty"){
+    const e=S.recipes.filter(isEmptyRecipe);
+    if(!e.length) return;
+    confirmBox("Remove empty recipes",e.length+" recipe"+(e.length===1?"":"s")+" with no ingredients and no notes will be removed. Batches are untouched.","Remove",
+      ()=>{ const ids=e.map(x=>x.id);
+        S.recipes=S.recipes.filter(x=>ids.indexOf(x.id)<0);
+        save("recipes"); flash("Removed "+ids.length+"."); render(); });
+  }
   if(a==="new-recipe"){const n=BLANK();S.recipes.push(n);save("recipes");nav(()=>{S.openRecipe=n.id;S.recipeView="edit";});}
   else if(a==="back"){nav(()=>{S.openRecipe=null;});}
   else if(a==="edit-mode"){nav(()=>{S.recipeView="edit";});}
@@ -2625,9 +2701,9 @@ function appClick(e){
     S.recipes.push(c); b.baseRecipeId=c.id; b.baseRecipeName=c.name; save("recipes"); save("batches");
     flash("Saved to the base library, locked."); render(); }
   else if(a==="add-f"&&r){r.fermentables.push({id:uid(),name:"",lb:0,ppg:37,lovibond:2,kind:"grain",dp:0});save(K);
-    setTbl("tbl-f",fermTable(r));refreshStats();}
+    setTbl("tbl-f",fermTable(r)); if(document.getElementById("tbl-bill")) render();refreshStats();}
   else if(a==="add-h"&&r){r.hops.push({id:uid(),name:"",oz:1,aa:10,form:"Pellet",use:"Boil",min:60});save(K);
-    setTbl("tbl-h",hopTable(r));refreshStats();}
+    setTbl("tbl-h",hopTable(r)); if(document.getElementById("tbl-bill")) render();refreshStats();}
   else if(a==="add-y"&&r){r.yeasts.push({id:uid(),name:"",atten:75});save(K);
     setTbl("tbl-y",yeastTable(r));refreshStats();}
   else if(a==="se-log"&&b){ const inp=document.getElementById("se-new");
@@ -2691,7 +2767,7 @@ function appClick(e){
     saveFile(slug(r.name)+"-shopping-list.txt",lines.join("\n"),"text/plain");
     flash("Shopping list written."); }
   else if(a==="add-x"&&r){r.miscs.push({id:uid(),name:"",amount:1,unit:"g",use:"Boil",time:15,cat:""});save(K);
-    setTbl("tbl-x",miscTable(r));refreshStats();}
+    setTbl("tbl-x",miscTable(r)); if(document.getElementById("tbl-bill")) render();refreshStats();}
   else if(a==="add-step"&&r){const last=r.mash.steps[r.mash.steps.length-1];
     r.mash.steps.push({id:uid(),name:"Step "+(r.mash.steps.length+1),type:"Infusion",
       tempF:last?Math.min(170,num(last.tempF)+10):152,timeMin:20,rampMin:0});
