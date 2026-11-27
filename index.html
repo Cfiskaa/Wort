@@ -146,6 +146,12 @@ fieldset[disabled] input,fieldset[disabled] select,fieldset[disabled] textarea{b
   padding:10px 14px calc(10px + env(safe-area-inset-bottom,0px)); font-size:13px; line-height:1.45;
   white-space:pre-wrap; max-height:40vh; overflow:auto}
 .errbar[hidden]{display:none}
+.navnow{display:none}
+@media (max-width:760px){
+  .navnow{display:block; flex:1; min-width:0; text-align:center; font-family:"Bricolage Grotesque",sans-serif;
+    font-weight:700; font-size:15px; letter-spacing:-.02em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .brand span{display:none}
+}
 .burger{display:none; align-items:center; justify-content:center; width:40px; height:40px; border-radius:9px;
   border:1px solid var(--line-strong); background:var(--surface-2); color:var(--ink); cursor:pointer; order:-1}
 .scrim{position:fixed; inset:0; background:rgba(5,12,16,.55); z-index:48}
@@ -202,6 +208,7 @@ input[type="range"].balrange{width:100%; margin:8px 0 0; height:26px; accent-col
 <header class="topbar">
   <div class="topbar-in">
     <div class="brand"><b>Wort</b><span>recipe design &amp; batch log</span></div>
+    <span class="navnow" id="navnow"></span>
     <nav class="tabs" id="tabs"></nav>
     <div class="unit-toggle" id="units">
       <button data-u="us" type="button">US</button><button data-u="metric" type="button">Metric</button>
@@ -270,13 +277,14 @@ const styleOf=n=>{ if(!n) return null;
 
 /* ========================= defaults ========================= */
 const EQ_DEFAULT=()=>({name:"5 gal (19 L) all-grain",batchGal:5,boilMin:60,evapGalHr:1.0,trubGal:0.5,
-  deadspaceGal:0.25,effPct:72,hopUtilPct:100,grainAbsorb:0.12,hopAbsorbGalOz:0,tunGal:0});
+  deadspaceGal:0.25,effPct:72,hopUtilPct:100,grainAbsorb:0.12,hopAbsorbGalOz:0,tunGal:0,hltLossF:0});
 const EQ_SEED=[
   EQ_DEFAULT(),
   {name:"5 gal BIAB, full volume",batchGal:5,boilMin:60,evapGalHr:1.1,trubGal:0.4,deadspaceGal:0,effPct:70,hopUtilPct:100,grainAbsorb:0.08},
   {name:"10 gal (38 L) all-grain",batchGal:10,boilMin:60,evapGalHr:1.5,trubGal:0.9,deadspaceGal:0.5,effPct:74,hopUtilPct:100,grainAbsorb:0.12},
   {name:"5 gal extract, partial boil",batchGal:5,boilMin:60,evapGalHr:0.6,trubGal:0.3,deadspaceGal:0,effPct:100,hopUtilPct:90,grainAbsorb:0.12}
 ];
+const MASH_TYPES=["Infusion","Temperature","Decoction","Batch sparge"];
 const MASH_DEFAULT=()=>({name:"Single infusion, medium body",grainTempF:68,spargeTempF:168,thickQtLb:1.33,infuseTempF:212,
   steps:[{id:uid(),name:"Saccharification",type:"Infusion",tempF:152,timeMin:60,rampMin:0}]});
 const MASH_SEED=[
@@ -303,7 +311,7 @@ function mashPlan(r,grainLb){
   const m=r.mash||MASH_DEFAULT(), out=[];
   let waterQt=0, cur=num(m.grainTempF), G=grainLb, Tw=num(m.infuseTempF)||212;
   (m.steps||[]).forEach((st,i)=>{
-    const T2=num(st.tempF); let infuseQt=0, note="", waterF=0;
+    const T2=num(st.tempF); let infuseQt=0, note="", waterF=0, isSparge=false;
     if(st.type==="Infusion"){
       if(i===0||waterQt===0){
         infuseQt = G*(num(m.thickQtLb)||1.33);
@@ -322,35 +330,46 @@ function mashPlan(r,grainLb){
         note = denom>0 ? `add at ${tOut(Tw)} ${tLbl()}`
                        : `infusion water must be hotter than ${tOut(T2)} ${tLbl()}`;
       }
+    } else if(st.type==="Batch sparge"){
+      /* Volume comes from what the kettle still needs, so it is filled in by calc once
+         the runoff is known. */
+      isSparge=true;
+      note="rinse — volume set by what the boil still needs";
+      waterF=num(m.spargeTempF)||168;
     } else if(st.type==="Decoction"){
       const pull = (T2>cur && 212>cur) ? (T2-cur)/(212-cur)*(waterQt+0.2*G) : 0;
       note = `pull ≈ ${isMetric()?rnd(pull*U.qtL,1)+" L":rnd(pull/4,2)+" gal"} of thick mash, boil, return`;
     } else {
       note = st.rampMin>0 ? `direct heat, ${st.rampMin} min ramp` : "direct heat";
     }
-    waterQt += infuseQt; cur = T2;
-    out.push({step:st, infuseQt, note, waterF, totalQt:waterQt});
+    if(!isSparge){ waterQt += infuseQt; cur = T2; }
+    out.push({step:st, infuseQt, note, waterF, isSparge, totalQt:waterQt});
   });
   return {rows:out, mashWaterQt:waterQt};
 }
 function hltRows(r,c){
   const m=r.mash||MASH_DEFAULT(), rows=[];
   (c.mp.rows||[]).forEach((p,i)=>{
-    if(p.infuseQt>0.001) rows.push({what:(i===0?"Strike — ":"")+(p.step.name||("Step "+(i+1))),
+    if(p.infuseQt>0.001) rows.push({what:(i===0&&!p.isSparge?"Strike — ":"")+(p.step.name||("Step "+(i+1))),
       gal:p.infuseQt/4, tempF:p.waterF});
   });
-  if(c.sparge>0.001) rows.push({what:"Sparge", gal:c.sparge, tempF:num(m.spargeTempF)});
+  if(!c.hasSpargeStep&&c.sparge>0.001) rows.push({what:"Sparge", gal:c.sparge, tempF:num(m.spargeTempF)});
   return rows;
 }
 function hltTable(r,c){
   const rows=hltRows(r,c);
   if(!rows.length) return `<p class="muted small" style="margin:4px 0">Add mashable grain to see the water plan.</p>`;
-  const tot=rows.reduce((a,x)=>a+x.gal,0);
-  return `<table><thead><tr><th>Heat</th><th class="num">${vLbl()}</th><th class="num">${tLbl()}</th></tr></thead><tbody>`
+  const tot=rows.reduce((a,x)=>a+x.gal,0), loss=num((r.equipment||{}).hltLossF);
+  return `<table class="itbl"><thead><tr><th>Heat</th><th class="num">${vLbl()}</th>
+      <th class="num">Into the tun</th>${loss?`<th class="num">Heat HLT to</th>`:""}</tr></thead><tbody>`
     + rows.map((x,i)=>`<tr class="row"><td>${i+1}. ${esc(x.what)}</td>
-        <td class="num">${vOut(x.gal)}</td><td class="num">${tOut(x.tempF)}</td></tr>`).join("")
-    + `<tr class="row"><td style="font-weight:600">Total into the HLT</td>
-        <td class="num" style="font-weight:600">${vOut(tot)}</td><td></td></tr></tbody></table>`;
+        <td class="num" data-l="${vLbl()}">${vOut(x.gal)}</td>
+        <td class="num" data-l="Into the tun">${tOut(x.tempF)} ${tLbl()}</td>
+        ${loss?`<td class="num" data-l="Heat HLT to" style="font-weight:600">${tOut(x.tempF+loss)} ${tLbl()}</td>`:""}</tr>`).join("")
+    + `<tr class="row"><td style="font-weight:600">Total</td>
+        <td class="num" data-l="${vLbl()}" style="font-weight:600">${vOut(tot)}</td><td></td>${loss?"<td></td>":""}</tr></tbody></table>`
+    + (loss?`<div class="note">Allowing ${rnd(isMetric()?loss*5/9:loss,1)} ${isMetric()?"°C":"°F"} lost between the hot liquor tank and the mash tun. Preheating the tun absorbs part of that; raise the figure in winter.</div>`
+          :`<div class="note">Set a hot liquor tank loss on the equipment profile and this will also tell you what to heat the tank to.</div>`);
 }
 function calc(r){
   const eq=r.equipment||EQ_DEFAULT();
@@ -400,10 +419,12 @@ function calc(r){
   const absorbGal=grainLb*num(eq.grainAbsorb||0.12);
   const runoff=Math.max(0,mashGal-absorbGal-num(eq.deadspaceGal));
   const sparge=Math.max(0,pre-runoff);
+  mp.rows.forEach(p=>{ if(p.isSparge){ p.infuseQt=sparge*4; p.waterF=num((r.mash||{}).spargeTempF)||168; } });
+  const hasSpargeStep=mp.rows.some(p=>p.isSparge);
   const tunGal=num(eq.tunGal), tunFillGal=mashGal+grainDispGal;
   return {og,fg,abv,ibu,srm:isFinite(srm)?srm:0,preG,pre,post,batch,bu:og>1?ibu/((og-1)*1000):0,
     cal:Math.max(0,calAl+calCarb),hopIbu,grainLb,mashGal,absorbGal,runoff,sparge,mp,totalWater:mashGal+sparge,
-    dp,boilOz,dryOz,hopLossGal,grainDispGal,tunGal,tunFillGal,
+    dp,boilOz,dryOz,hopLossGal,grainDispGal,tunGal,tunFillGal,hasSpargeStep,hltLossF:num(eq.hltLossF),
     tunOK: tunGal>0 ? tunFillGal<=tunGal : null};
 }
 
@@ -442,7 +463,8 @@ function fill(r){
   (r.hops||[]).forEach(h=>{ if(!h.form) h.form="Pellet"; });
   (r.fermentables||[]).forEach(f=>{ if(f.dp===undefined){
     const lib=FERM_LIB.find(x=>x[0]===f.name); f.dp=lib?lib[4]:(f.kind==="grain"?35:0); } });
-  if(r.equipment){ if(r.equipment.hopAbsorbGalOz===undefined) r.equipment.hopAbsorbGalOz=0;
+  if(r.equipment){ if(r.equipment.hltLossF===undefined) r.equipment.hltLossF=0;
+    if(r.equipment.hopAbsorbGalOz===undefined) r.equipment.hopAbsorbGalOz=0;
     if(r.equipment.tunGal===undefined) r.equipment.tunGal=0; }
   return r;
 }
@@ -697,11 +719,27 @@ const TABS=[["recipes","Base recipes"],["batches","Batches"],["inventory","Inven
 const TAB_COUNT={recipes:()=>S.recipes.length, batches:()=>S.batches.length,
   inventory:()=>S.inventory.length, profiles:()=>S.equipProfiles.length+S.mashProfiles.length, tools:()=>null,
   sync:()=>null};
+/* On a phone the section strip can scroll the active tab out of sight, so the top bar
+   says where you are. */
+function currentSectionName(){
+  if(S.timerOpen&&TIMER) return "Brew day";
+  if(S.tab==="batches"&&S.openBatch){
+    const f=BATCH_SECS.find(x=>x[0]===(S.secB||"batch")); return f?f[1]:"Batch";
+  }
+  if(S.tab==="recipes"&&S.openRecipe){
+    if(S.recipeView==="edit"){ const f=REC_SECS.find(x=>x[0]===(S.secR||"fermentables")); return f?f[1]:"Recipe"; }
+    const b=document.querySelector(`.secbar [data-seco="${S.secO||"summary"}"]`);
+    return b?b.textContent.trim():"Recipe";
+  }
+  const t=TABS.find(x=>x[0]===S.tab); return t?t[1]:"Wort";
+}
+function paintNavNow(){ const e=document.getElementById("navnow"); if(e) e.textContent=currentSectionName(); }
 function paintChrome(){
   paintTheme();
   document.getElementById("tabs").innerHTML=TABS.map(([k,l])=>
     `<button class="tab" data-tab="${k}" aria-current="${S.tab===k}">${l}</button>`).join("");
   document.querySelectorAll("#units button").forEach(b=>b.setAttribute("aria-pressed",S.settings.units===b.dataset.u));
+  paintNavNow();
   const d=document.getElementById("drawer");
   if(d) d.innerHTML=`<h2>Wort</h2>`
     + TABS.map(([k,l])=>{ const n=TAB_COUNT[k]();
@@ -750,6 +788,7 @@ function render_(){
   if(S.tab==="batches"&&S.openBatch){ refreshStats(); drawFermChart(); paintSession(); }
   if(S.tab==="tools") runAllTools();
   paintSync();
+  paintNavNow();
 }
 /* Moving between screens returns to the top, but eases rather than jumps, so it is
    clear the page moved rather than being replaced under you. */
@@ -889,6 +928,7 @@ function recipeSection(r,key){
           <label class="fld"><span>Hop absorption (${vLbl()}/${hLbl()})</span><input type="number" step="0.01" data-e="hopAbsorbGalOz" data-conv="hopabs" value="${rnd(isMetric()?eq.hopAbsorbGalOz*U.galL/U.ozG:eq.hopAbsorbGalOz,4)}" placeholder="0"></label>
           <label class="fld"><span>Hop utilisation (%)</span><input type="number" step="1" data-e="hopUtilPct" value="${eq.hopUtilPct}"></label>
           <label class="fld"><span>Mash tun capacity (${vLbl()})</span><input type="number" step="0.5" data-e="tunGal" data-conv="v" value="${vOut(eq.tunGal)}" placeholder="0 = no check"></label>
+          <label class="fld"><span>HLT to mash tun loss (${tLbl()})</span><input type="number" step="1" data-e="hltLossF" data-conv="t2" value="${rnd(isMetric()?num(eq.hltLossF)*5/9:num(eq.hltLossF),1)}" placeholder="0"></label>
         </div></div></div>`;
   }
   if(key==="fermentables") return `<div class="panel"><div class="panel-head"><h2>Fermentables</h2>
@@ -1119,7 +1159,7 @@ function mashTable(r){
   return `<table class="itbl"><thead><tr><th>Step</th><th>Type</th><th class="num">${tLbl()}</th><th class="num">min</th>
     <th class="num">ramp</th><th>Water</th><th></th></tr></thead><tbody>`+
   m.steps.map(s=>`<tr class="row"><td><input data-s="${s.id}:name" value="${esc(s.name)}"></td>
-    <td data-l="Type" style="width:116px"><select data-s="${s.id}:type">${["Infusion","Temperature","Decoction"].map(t=>
+    <td data-l="Type" style="width:116px"><select data-s="${s.id}:type">${MASH_TYPES.map(t=>
       `<option${s.type===t?" selected":""}>${t}</option>`).join("")}</select></td>
     <td class="num" data-l="${tLbl()}" style="width:72px"><input type="number" step="1" data-s="${s.id}:tempF" data-conv="t" value="${tOut(s.tempF)}"></td>
     <td class="num" data-l="Minutes" style="width:64px"><input type="number" step="5" data-s="${s.id}:timeMin" value="${num(s.timeMin)}"></td>
@@ -1191,6 +1231,24 @@ function refreshStats(){
     if(cell) cell.textContent=totLb>0?Math.round(num(f.lb)/totLb*100):0; });
   (r.hops||[]).forEach(h=>{ const cell=document.querySelector(`[data-ibu="${h.id}"]`);
     if(cell) cell.textContent=(c.hopIbu[h.id]||0).toFixed(1); });
+  /* Per-step water, the tank plan and the stock check all live outside #stats. */
+  c.mp.rows.forEach(p=>{
+    const cell=document.querySelector(`[data-step="${p.step.id}"]`); if(!cell) return;
+    const amt=p.infuseQt>0?(isMetric()?rnd(p.infuseQt*U.qtL,1)+" L":rnd(p.infuseQt/4,2)+" gal")+" \u00b7 ":"";
+    cell.textContent=amt+p.note;
+  });
+  const hl=document.getElementById("hlt");
+  if(hl) hl.innerHTML=hltTable(r,c);
+  const mk=document.getElementById("mashkv");
+  if(mk) mk.innerHTML = c.grainLb>0 ? `
+    <dt>Mash water</dt><dd>${vOut(c.mashGal)} ${vLbl()}</dd>
+    <dt>\u2212 Grain absorption</dt><dd>${vOut(c.absorbGal)} ${vLbl()}</dd>
+    <dt>\u2212 Tun deadspace</dt><dd>${vOut(num((r.equipment||{}).deadspaceGal))} ${vLbl()}</dd>
+    <dt>First runnings</dt><dd>${vOut(c.runoff)} ${vLbl()}</dd>
+    <dt>${c.hasSpargeStep?"Batch sparge":"Sparge"} at ${tOut((r.mash||{}).spargeTempF)} ${tLbl()}</dt><dd>${vOut(c.sparge)} ${vLbl()}</dd>
+    <dt>Total water</dt><dd>${vOut(c.totalWater)} ${vLbl()}</dd>` :
+    `<dt>Mash water</dt><dd class="muted">add mashable grain first</dd>`;
+  const sh=document.getElementById("shop"); if(sh) sh.innerHTML=shortfall(r);
 }
 
 function shortNeeds(r){
@@ -1244,7 +1302,8 @@ function equipBody(p){
   const f=(k,label,conv,step)=>`<label class="fld"><span>${label}</span>
     <input type="number" step="${step||"0.1"}" data-ep="${p.id}:${k}"${conv?` data-conv="${conv}"`:""}
       value="${conv==="v"?vOut(num(p[k])):conv==="absorb"?rnd(isMetric()?num(p[k])*U.galL/U.lbKg:num(p[k]),3)
-            :conv==="hopabs"?rnd(isMetric()?num(p[k])*U.ozG/U.galL:num(p[k]),4):num(p[k])}"></label>`;
+            :conv==="hopabs"?rnd(isMetric()?num(p[k])*U.ozG/U.galL:num(p[k]),4)
+            :conv==="t2"?rnd(isMetric()?num(p[k])*5/9:num(p[k]),1):num(p[k])}"></label>`;
   return `<div class="panel-body">
     <label class="fld" style="margin-bottom:10px"><span>Name</span><input data-ep="${p.id}:name" value="${esc(p.name)}"></label>
     <div class="cols">
@@ -1258,6 +1317,7 @@ function equipBody(p){
       ${f("hopAbsorbGalOz","Hop absorption ("+vLbl()+"/"+hLbl()+")","hopabs","0.005")}
       ${f("hopUtilPct","Hop utilisation (%)",null,"1")}
       ${f("tunGal","Mash tun capacity ("+vLbl()+")","v","0.5")}
+      ${f("hltLossF","HLT to mash tun loss ("+tLbl()+")","t2","1")}
     </div></div>`;
 }
 function mashBody(p){
@@ -1266,7 +1326,7 @@ function mashBody(p){
       value="${conv==="t"?tOut(num(p[k])):conv==="thick"?thickOut(num(p[k])):num(p[k])}"></label>`;
   const steps=(p.steps||[]).map(st=>`<tr class="row">
       <td><input data-mps="${p.id}:${st.id}:name" value="${esc(st.name||"")}"></td>
-      <td data-l="Type" style="width:116px"><select data-mps="${p.id}:${st.id}:type">${["Infusion","Temperature","Decoction"].map(t=>
+      <td data-l="Type" style="width:116px"><select data-mps="${p.id}:${st.id}:type">${MASH_TYPES.map(t=>
         `<option${st.type===t?" selected":""}>${t}</option>`).join("")}</select></td>
       <td class="num" data-l="${tLbl()}" style="width:74px"><input type="number" step="1" data-mps="${p.id}:${st.id}:tempF" data-conv="t" value="${tOut(num(st.tempF))}"></td>
       <td class="num" data-l="Minutes" style="width:66px"><input type="number" step="5" data-mps="${p.id}:${st.id}:timeMin" value="${num(st.timeMin)}"></td>
@@ -1455,24 +1515,44 @@ function splitTabs(b){
       kids.map(k=>tab(k,k.splitLabel||k.name)).join("")}</nav>
     <span class="small muted">${kids.length} parts, one wort</span></div>`;
 }
-const BATCH_SECS=[["batch","Batch"],["session","Brew session"],["ferment","Fermentation"]]
-  .concat(REC_SECS.map(x=>x[0]==="notes"?["bnotes","Notes"]:x));
+const BATCH_SECS=[["batch","Batch"],["session","Brew session"],["ferment","Fermentation"],["bnotes","Notes"]];
+/* The recipe sits inside Batch, grouped by category in the order of a brew day:
+   what goes in the tun, the schedule that runs it, then the boil, then the pitch. */
+function batchRecipe(b){
+  const r=b.recipe, eq=r.equipment||EQ_DEFAULT();
+  const eqOpts=`<option value="">Load a different profile…</option>`+S.equipProfiles.map(p=>
+    `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  return `<div class="panel"><div class="panel-head"><h2>Equipment</h2>
+      <span class="small muted" style="flex:1">${esc(eq.name||"—")}</span>
+      <select data-loadeq style="max-width:220px">${eqOpts}</select></div>
+      <div class="panel-body small muted">Volumes, losses and efficiency live on the profile, and in Brew session once you have measured them.</div></div>
+    ${recipeSection(r,"fermentables")}
+    ${recipeSection(r,"mash")}
+    ${recipeSection(r,"hops")}
+    ${recipeSection(r,"misc")}
+    ${recipeSection(r,"yeast")}`;
+}
 function batchSection(b){
   const k=S.secB||"batch";
-  if(k==="batch") return `<div class="panel"><div class="panel-body cols">
-      <label class="fld" style="grid-column:1/-1"><span>Batch name</span><input data-b="name" value="${esc(b.name)}"></label>
-      <label class="fld"><span>Brew date</span><input type="date" data-b="brewDate" value="${esc(b.brewDate||"")}"></label>
-      <label class="fld"><span>Status</span><select data-b="status">${
-        ["Planned","Fermenting","Conditioning","Packaged","Split","Archived"].map(x=>
-          `<option${b.status===x?" selected":""}>${x}</option>`).join("")}</select></label>
-      <label class="fld"><span>Target OG</span><input type="number" step="0.001" data-b="targetOG" value="${esc(b.targetOG||"")}"></label>
-      <label class="fld"><span>Measured OG</span><input type="number" step="0.001" data-b="actualOG" value="${esc(b.actualOG||"")}"></label>
-      <label class="fld"><span>Measured FG</span><input type="number" step="0.001" data-b="actualFG" value="${esc(b.actualFG||"")}"></label>
-      <label class="fld"><span>Packaged</span><input type="date" data-b="packagedDate" value="${esc(b.packagedDate||"")}"></label>
-    </div></div>
-    ${S.batches.some(x=>x.parentBatchId===b.id)
-      ? `<div class="panel"><div class="panel-body small muted">This batch was split. Everything up to pitching is recorded here;
-         dry hops, readings and final gravity belong to the parts above.</div></div>` : ""}`;
+  if(k==="batch"){
+    const ro=(l,v)=>`<label class="fld"><span>${l}</span>
+      <input value="${esc(v||"—")}" readonly tabindex="-1" style="background:var(--surface-2);color:var(--muted)"></label>`;
+    return `<div class="panel"><div class="panel-body cols">
+        <label class="fld"><span>Brew date</span><input type="date" data-b="brewDate" value="${esc(b.brewDate||"")}"></label>
+        <label class="fld"><span>Status</span><select data-b="status">${
+          ["Planned","Fermenting","Conditioning","Packaged","Split","Archived"].map(x=>
+            `<option${b.status===x?" selected":""}>${x}</option>`).join("")}</select></label>
+        <label class="fld"><span>Packaged</span><input type="date" data-b="packagedDate" value="${esc(b.packagedDate||"")}"></label>
+        ${ro("Target OG",b.targetOG)}
+        ${ro("Measured OG",b.actualOG)}
+        ${ro("Measured FG",b.actualFG)}
+      </div>
+      <div class="panel-body small muted" style="padding-top:0">Target gravity comes from the recipe. Measured gravities are recorded in Brew session.</div></div>
+      ${S.batches.some(x=>x.parentBatchId===b.id)
+        ? `<div class="panel"><div class="panel-body small muted">This batch was split. Everything up to pitching is recorded here;
+           dry hops, readings and final gravity belong to the parts above.</div></div>` : ""}
+      ${batchRecipe(b)}`;
+  }
   if(k==="session") return sessionPanel(b);
   if(k==="ferment"){
     const rows=(b.readings||[]).slice().sort((x,y)=>(x.date||"").localeCompare(y.date||""));
@@ -1486,13 +1566,14 @@ function batchSection(b){
         <td class="num" data-l="Gravity" style="width:96px"><input type="number" step="0.001" data-r="${x.id}:sg" value="${esc(x.sg||"")}"></td>
         <td class="num" data-l="Temp ${tLbl()}" style="width:86px"><input type="number" step="0.5" data-r="${x.id}:tempF" data-conv="t" value="${x.tempF===""||x.tempF==null?"":tOut(num(x.tempF))}"></td>
         <td data-l="Note"><input data-r="${x.id}:note" value="${esc(x.note||"")}"></td>
-        <td class="rowtools"><button class="btn btn-quiet btn-sm" data-rmr="${x.id}">✕</button></td></tr>`).join("")+`</tbody></table>`
+        <td class="rowtools"><button class="btn btn-quiet btn-sm" data-rmr="${x.id}">\u2715</button></td></tr>`).join("")+`</tbody></table>`
         :`<p class="muted small">No readings yet. Log gravity and temperature every few days to see the curve flatten.</p>`}
       </div></div></div>`;
   }
-  if(k==="bnotes") return `<div class="panel"><div class="panel-head"><h2>Batch notes</h2></div>
-    <div class="panel-body"><textarea data-b="notes" placeholder="Mash temps hit, pitch rate, off-flavours, tasting notes.">${esc(b.notes||"")}</textarea></div></div>`;
-  return recipeSection(b.recipe,k);
+  return `<div class="panel"><div class="panel-head"><h2>Batch notes</h2>
+      <span class="small muted">brew session entries land here too</span></div>
+    <div class="panel-body"><textarea data-b="notes" style="min-height:260px"
+      placeholder="Mash temps hit, pitch rate, off-flavours, tasting notes.">${esc(b.notes||"")}</textarea></div></div>`;
 }
 function batchEditor(){
   const b=curB(); if(!b){S.openBatch=null;return batchList();}
@@ -1510,7 +1591,12 @@ function batchEditor(){
       <button class="btn btn-sm" data-act="del-batch">Delete</button></div>
       ${base?`<div class="basedon">Based on <b>${esc(base.name)}</b>${base.locked?" (locked)":""} — edits here stay in this batch.</div>`:""}
       ${splitTabs(b)}
-      </div>
+      <div class="panel-body">
+        <label class="fld"><span>Batch</span><input data-b="name" value="${esc(b.name)}"
+          style="font-family:'Bricolage Grotesque',sans-serif;font-weight:700;font-size:18px"></label>
+        <p class="muted small" style="margin:6px 0 0">${esc(b.brewDate||"no date")} \u00b7 ${esc(b.status)}${
+          b.baseRecipeName?" \u00b7 from "+esc(b.baseRecipeName):""}</p>
+      </div></div>
     ${secBar(BATCH_SECS,S.secB||"batch","secb")}
     ${batchSection(b)}
   </div>
@@ -1828,7 +1914,7 @@ function doSplit(){
    taking the newer of each pair by id, and honouring a tombstone newer than the record
    it refers to. Nothing is overwritten wholesale, so two devices can both have worked
    offline and neither loses anything but the field the other changed later. */
-const APP_VERSION="3.5.0";
+const APP_VERSION="3.6.0";
 const SYNC_KEYS=["recipes","batches","inventory","equipProfiles","mashProfiles"];
 
 /* A record is compared ignoring _u, with keys in a fixed order, so a trip through
@@ -2187,10 +2273,27 @@ function sessionPanel(b){
   const ft=(k,label)=>`<label class="fld"><span>${label} (${tLbl()})</span>
     <input type="number" step="1" data-se="${k}" data-sconv="t" value="${se[k]===""||se[k]==null?"":tOut(num(se[k]))}"></label>`;
   const log=(se.log||[]).slice().sort((x,y)=>(y.at||"").localeCompare(x.at||""));
-  return `<div class="panel"><div class="panel-head"><h2>Brew session</h2>
+  const b2=curB();
+  return `<div class="panel"><div class="panel-head"><h2>Log</h2>
+      <span class="small muted">stamped, and copied into Notes</span></div>
+    <div class="panel-body">
+      <div class="inline"><input id="se-new" placeholder="Doughed in at 154, insulated the tun" style="flex:1 1 220px">
+        <button class="btn btn-primary fix" data-act="se-log">Log it</button></div>
+      <div style="margin-top:10px">${log.length?log.map(x=>
+        `<div class="addrow"><span class="muted" style="flex:0 0 112px">${esc((x.at||"").replace("T"," ").slice(0,16))}</span>
+         <span style="flex:1;min-width:0">${esc(x.text)}</span>
+         <button class="btn btn-quiet btn-sm" data-rmlog="${x.id}">\u2715</button></div>`).join("")
+        :`<p class="muted small" style="margin:0">Nothing logged yet. Entries are stamped with the time you add them, here or from the brew-day timer.</p>`}</div>
+    </div></div>
+  <div class="panel"><div class="panel-head"><h2>Brew session</h2>
       <span class="small muted">what actually happened</span>
       <button class="btn btn-sm" data-act="se-apply" title="Writes measured kettle efficiency and boil-off into this batch\u2019s equipment">Update equipment from these</button></div>
     <div class="panel-body">
+      <h3 class="subhead">Gravities</h3>
+      <div class="cols">
+        <label class="fld"><span>Measured OG</span><input type="number" step="0.001" data-b="actualOG" value="${esc((b2&&b2.actualOG)||"")}"></label>
+        <label class="fld"><span>Measured FG</span><input type="number" step="0.001" data-b="actualFG" value="${esc((b2&&b2.actualFG)||"")}"></label>
+      </div>
       <h3 class="subhead">Mash</h3>
       <div class="cols">${ft("strikeTempF","Strike water")}${ft("mashInTempF","Mash in, hit")}
         ${ft("mashOutTempF","Mash out, ended")}${f("firstRunSG","First runnings SG","0.001")}</div>
@@ -2202,15 +2305,16 @@ function sessionPanel(b){
         ${ft("pitchTempF","Pitch temp")}${ft("calTempF","Hydrometer calibrated at")}
         <label class="fld"><span>Yeast pitched</span><input type="datetime-local" data-se="pitchedAt" value="${esc(se.pitchedAt||"")}"></label></div>
       <dl class="kv" id="se-out" style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px"></dl>
-      <h3 class="subhead" style="margin-top:16px">Timed log</h3>
-      <div class="inline"><input id="se-new" placeholder="Doughed in at 154, insulated the tun" style="flex:1 1 240px">
-        <button class="btn fix" data-act="se-log">Log it</button></div>
-      <div style="margin-top:10px">${log.length?log.map(x=>
-        `<div class="addrow"><span class="muted" style="flex:0 0 118px">${esc((x.at||"").replace("T"," ").slice(0,16))}</span>
-         <span style="flex:1;min-width:0">${esc(x.text)}</span>
-         <button class="btn btn-quiet btn-sm" data-rmlog="${x.id}">\u2715</button></div>`).join("")
-        :`<p class="muted small" style="margin:0">Nothing logged yet. Entries are stamped with the time you add them, here or from the brew-day timer.</p>`}</div>
     </div></div>`;
+}
+/* A log entry belongs in two places: the session, and the notes you read afterwards. */
+function logToBatch(b,txt,extra){
+  b.session=b.session||SESSION_BLANK(); b.session.log=b.session.log||[];
+  const now=new Date();
+  const stamp=now.toISOString().slice(0,16);
+  b.session.log.push({id:uid(),at:stamp,text:txt+(extra?" \u2014 "+extra:"")});
+  const line=stamp.replace("T"," ")+" \u2014 "+txt+(extra?" ("+extra+")":"");
+  b.notes=(b.notes&&b.notes.trim()?b.notes.replace(/\s+$/,"")+"\n":"")+line;
 }
 function paintSession(){
   const b=curB(); const out=document.getElementById("se-out"); if(!b||!out) return;
@@ -2528,9 +2632,7 @@ function appClick(e){
     setTbl("tbl-y",yeastTable(r));refreshStats();}
   else if(a==="se-log"&&b){ const inp=document.getElementById("se-new");
     const txt=(inp&&inp.value||"").trim(); if(!txt) return;
-    b.session=b.session||SESSION_BLANK(); b.session.log=b.session.log||[];
-    b.session.log.push({id:uid(),at:new Date().toISOString().slice(0,16),text:txt});
-    inp.value=""; save("batches"); render(); }
+    logToBatch(b,txt); inp.value=""; save("batches"); render(); }
   else if(a==="se-apply"&&b){
     const s2=sessionCalc(b), eq=b.recipe.equipment;
     if(s2.kettleEff==null&&s2.evap==null){ flash("Record a gravity and the volumes first."); return; }
@@ -2549,11 +2651,9 @@ function appClick(e){
     const txt=(inp&&inp.value||"").trim(); if(!txt) return;
     const tb=S.batches.find(x=>x.id===TIMER.id);
     if(!tb){ flash("Open this as a batch to keep a session log."); return; }
-    tb.session=tb.session||SESSION_BLANK(); tb.session.log=tb.session.log||[];
     const p=tPhase();
-    tb.session.log.push({id:uid(),at:new Date().toISOString().slice(0,16),
-      text:txt+" \u2014 "+p.name+", "+fmtMS(tRemain())+" left"});
-    inp.value=""; save("batches"); flash("Logged to the brew session."); }
+    logToBatch(tb,txt,p.name+", "+fmtMS(tRemain())+" left");
+    inp.value=""; save("batches"); flash("Logged to the session and the notes."); }
   else if(a==="timer"&&r){ startTimer(activeKey(), S.tab==="batches"?b.id:base.id, r); }
   else if(a==="t-close"){ nav(()=>{S.timerOpen=false; keepAwake(false);}); }
   else if(a==="t-play"&&TIMER){
@@ -2615,6 +2715,7 @@ function conv(el,raw){
   if(c==="t") return tIn(raw); if(c==="thick") return thickIn(raw);
   if(c==="absorb") return isMetric()?raw*U.lbKg/U.galL:raw;
   if(c==="hopabs") return isMetric()?raw*U.ozG/U.galL:raw;
+  if(c==="t2") return isMetric()?raw*9/5:raw;   /* a temperature difference, not a temperature */
   return raw;
 }
 app.addEventListener("input",e=>{
