@@ -916,6 +916,25 @@ function newBatchFrom(base,name){
 /* Nothing in it, nothing written on it: safe to offer for removal. */
 const isEmptyRecipe=r=>!(r.fermentables||[]).length && !(r.hops||[]).length
   && !(r.yeasts||[]).length && !(r.miscs||[]).length && !String(r.notes||"").trim();
+/* The fuller of two records with the same name is the one to keep. */
+function recordWeight(b){
+  let w=0;
+  if(b.brewDate) w+=4; if(b.actualOG) w+=3; if(b.actualFG) w+=3;
+  w+=((b.readings||[]).length)*2;
+  const se=b.session||{};
+  w+=Object.keys(se).filter(k=>k!=="log"&&se[k]!==""&&se[k]!=null).length;
+  w+=((se.log||[]).length)*2;
+  w+=Math.min(10,String(b.notes||"").length/40);
+  w+=((b.recipe&&b.recipe.fermentables)||[]).length;
+  if(b.parentBatchId||b.splitInto) w+=5;
+  return w;
+}
+function dupeGroups(){
+  const by={};
+  S.batches.forEach(b=>{ const k=normName(b.name)+"|"+(b.brewDate||"");
+    (by[k]=by[k]||[]).push(b); });
+  return Object.values(by).filter(g=>g.length>1);
+}
 function recipeList(){
   const q=normName(S.recQ||"");
   const list=S.recipes.filter(r=>!q||normName(r.name).indexOf(q)>-1||normName(r.style).indexOf(q)>-1);
@@ -1661,6 +1680,7 @@ function batchList(){
       <div class="nums"><span class="muted">OG <b>${b.actualOG||"–"}</b></span><span class="muted">FG <b>${b.actualFG||"–"}</b></span>
       <span class="muted">ABV <b>${abv}</b></span><span class="muted">${(b.readings||[]).length} readings</span></div></span></button>`;
   }).join("");
+  const dups=dupeGroups(), dupExtra=dups.reduce((a,g)=>a+g.length-1,0);
   return `<div class="panel"><div class="panel-head"><h2>Batches</h2>
     <button class="btn btn-sm" data-act="import">Import BeerXML</button>
     <button class="btn btn-sm" data-act="import-bsmx">Session data (.bsmx)</button>
@@ -1671,6 +1691,9 @@ function batchList(){
       ${S.batches.length?`<div class="cardlist">${items}</div>`:
       `<div class="empty"><p>No batches logged. Open a base recipe and choose “Brew this”, import one, or start a blank batch.</p>
       <button class="btn btn-primary" data-act="new-batch">New batch</button></div>`}
+      ${dupExtra?`<div class="note" style="color:var(--warn);display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <span style="flex:1;min-width:200px">${dupExtra} duplicate batch${dupExtra===1?"":"es"} across ${dups.length} name${dups.length===1?"":"s"} — usually a backup restored into a copy that had its own ids.</span>
+        <button class="btn btn-sm" data-act="dedupe">Merge them</button></div>`:""}
       <div class="note">Each batch carries its own copy of the recipe — change it to match what you actually did without touching the base.</div>
       </div><div class="syncline" id="syncline"></div></div>`;
 }
@@ -2063,7 +2086,7 @@ function libMeta(cat,name){
    part take its own dry hops and fermentation additions from here on. */
 /* A sandboxed iframe ignores window.confirm and returns false, so every destructive
    action silently did nothing. Ask inside the page instead. */
-let CONFIRM=null;
+let CONFIRM=null, PENDING_BACKUP=null;
 function confirmBox(title,message,yesLabel,onYes){
   CONFIRM=onYes;
   const dlg=document.getElementById("dlg");
@@ -2140,7 +2163,7 @@ function doSplit(){
    taking the newer of each pair by id, and honouring a tombstone newer than the record
    it refers to. Nothing is overwritten wholesale, so two devices can both have worked
    offline and neither loses anything but the field the other changed later. */
-const APP_VERSION="3.11.0";
+const APP_VERSION="3.13.0";
 const SYNC_KEYS=["recipes","batches","inventory","equipProfiles","mashProfiles"];
 
 /* A record is compared ignoring _u, with keys in a fixed order, so a trip through
@@ -2399,8 +2422,48 @@ function backupDoc(){
   d.settings=S.settings;
   return d;
 }
+/* Two copies of the app give the same brew different ids, so a backup from one would
+   land beside the records in the other rather than on top of them. Line them up by
+   name first; merging then updates in place instead of duplicating. */
+function alignIds(doc){
+  const nameOf=(k,r)=>k==="inventory"?(r.cat||"")+"|"+normName(r.name):normName(r.name);
+  SYNC_KEYS.forEach(k=>{
+    const incoming=doc.data[k]; if(!incoming||!incoming.length) return;
+    const mine={}, taken={};
+    (S[k]||[]).forEach(r=>{ const n=nameOf(k,r); if(n&&!mine[n]) mine[n]=r.id; });
+    const byId={}; (S[k]||[]).forEach(r=>byId[r.id]=1);
+    incoming.forEach(r=>{
+      if(byId[r.id]) { taken[r.id]=1; return; }      /* already the same record */
+      const n=nameOf(k,r), hit=n&&mine[n];
+      if(hit&&!taken[hit]){ r.id=hit; taken[hit]=1; }
+    });
+  });
+  return doc;
+}
+/* A backup is a source to lay over what is here, not a statement of what should exist.
+   A field it does not carry is no opinion, not a deletion, and a blank never clears
+   something already recorded. */
+function overlay(base,add){
+  if(Array.isArray(add)) return add.length?add:(Array.isArray(base)?base:add);
+  if(add&&typeof add==="object"&&base&&typeof base==="object"&&!Array.isArray(base)){
+    const out=Object.assign({},base);
+    Object.keys(add).forEach(k=>{
+      const v=add[k];
+      if(v===undefined) return;
+      if(v===""||v===null){ if(!(k in out)) out[k]=v; return; }
+      out[k]=overlay(base[k],v);
+    });
+    return out;
+  }
+  return add;
+}
 function restoreDoc(doc){
   if(!doc||!doc.data) throw new Error("that file is not a Wort backup");
+  alignIds(doc);
+  SYNC_KEYS.forEach(k=>{
+    const mine={}; (S[k]||[]).forEach(r=>mine[r.id]=r);
+    doc.data[k]=(doc.data[k]||[]).map(r=>mine[r.id]?overlay(mine[r.id],r):r);
+  });
   const t=Object.assign({},doc.tombs||{});
   SYNC_KEYS.forEach(k=>{
     const tk=Object.assign({},(t[k]||{}),(S.tombs&&S.tombs[k])||{});
@@ -2731,6 +2794,24 @@ dlgEl.addEventListener("click",e=>{
   if(t.dataset.sprm){ S.splitRows.splice(+t.dataset.sprm,1);
     const even=rnd(100/S.splitRows.length,1); S.splitRows.forEach(x=>x.pct=even);
     if(S.splitDraw) S.splitDraw(); return; }
+  if(a==="rs-cancel"){ PENDING_BACKUP=null; dlgEl.close(); return; }
+  if(a==="rs-merge"||a==="rs-replace"){
+    const doc=PENDING_BACKUP; PENDING_BACKUP=null; dlgEl.close();
+    if(!doc) return;
+    try{
+      if(a==="rs-replace"){
+        /* Start from nothing so the file is the whole truth, and clear the tombstones
+           with it or the old deletions would delete the new records too. */
+        SYNC_KEYS.forEach(k=>{ S[k]=[]; });
+        S.tombs={}; S.openRecipe=null; S.openBatch=null; rebase();
+      }
+      restoreDoc(doc);
+      if(doc.settings&&a==="rs-replace"){ S.settings=Object.assign({},S.settings,doc.settings); save("settings"); }
+      flash(a==="rs-replace"?"Replaced from the backup.":"Backup merged.");
+      nav();
+    }catch(e){ flash(e&&e.message?e.message:"restore failed"); }
+    return;
+  }
   if(a==="cf-yes"){ const fn=CONFIRM; CONFIRM=null; dlgEl.close(); if(fn) fn(); return; }
   if(a==="cf-no"){ CONFIRM=null; dlgEl.close(); return; }
   if(a==="sp-add"){ S.splitRows.push({name:"Part "+String.fromCharCode(65+S.splitRows.length),pct:0});
@@ -2757,8 +2838,24 @@ filein.addEventListener("change",async()=>{
       filein.value=""; render(); return;
     }
     if(S.importTo==="backup"){
-      restoreDoc(JSON.parse(await f.text()));
-      flash("Backup restored."); filein.value=""; render(); return;
+      const doc=JSON.parse(await f.text());
+      if(!doc||!doc.data) throw new Error("that file is not a Wort backup");
+      const counts=SYNC_KEYS.map(k=>`${(doc.data[k]||[]).length} ${k==="equipProfiles"?"equipment profiles"
+        :k==="mashProfiles"?"mash profiles":k}`).join(" \u00b7 ");
+      PENDING_BACKUP=doc;
+      const dlg=document.getElementById("dlg");
+      document.getElementById("dlg-body").innerHTML=
+        `<h2>Restore a backup</h2>
+         <p class="small muted" style="margin:8px 0 6px">The file holds ${esc(counts)}.</p>
+         <p class="small muted" style="margin:0 0 18px">Merging lays it over what is already here and keeps anything the file
+           does not mention. Replacing throws away everything in the app first.</p>
+         <div class="inline">
+           <button class="btn fix" data-act="rs-cancel" style="min-height:44px;padding:0 16px">Cancel</button>
+           <button class="btn fix" data-act="rs-replace" style="min-height:44px;padding:0 16px">Replace everything</button>
+           <button class="btn btn-primary fix" data-act="rs-merge" style="min-height:44px;padding:0 16px">Merge</button>
+         </div>`;
+      if(!dlg.open) dlg.showModal();
+      filein.value=""; return;
     }
     const list=importBeerXML(await f.text());
     const n=list.length, skipped=SKIPPED;
@@ -2960,6 +3057,38 @@ function appClick(e){
     S.mashProfiles.push(p);save("mashProfiles");flash("Mash profile saved.");}
   else if(a==="new-eq"){S.equipProfiles.push(Object.assign({id:uid()},EQ_DEFAULT(),{name:"New equipment profile"}));save("equipProfiles");render();}
   else if(a==="new-mash"){S.mashProfiles.push(Object.assign({id:uid()},JSON.parse(JSON.stringify(MASH_DEFAULT())),{name:"New mash profile"}));save("mashProfiles");render();}
+  else if(a==="dedupe"){
+    const groups=dupeGroups(); if(!groups.length) return;
+    const extra=groups.reduce((a,g)=>a+g.length-1,0);
+    confirmBox("Merge duplicates",extra+" duplicate batch"+(extra===1?"":"es")+
+      " will be removed, keeping the fullest record of each. Anything only the other copy had is copied onto the keeper first.","Merge",
+      ()=>{ const drop=[];
+        groups.forEach(g=>{
+          g.sort((a,b)=>recordWeight(b)-recordWeight(a));
+          const keep=g[0];
+          g.slice(1).forEach(x=>{
+            /* carry across anything the keeper is missing before dropping it */
+            ["brewDate","packagedDate","actualOG","actualFG","targetOG","baseRecipeId","baseRecipeName"]
+              .forEach(f=>{ if(!keep[f]&&x[f]) keep[f]=x[f]; });
+            if(!(keep.readings||[]).length&&(x.readings||[]).length) keep.readings=x.readings;
+            keep.session=keep.session||SESSION_BLANK();
+            Object.keys(x.session||{}).forEach(f=>{
+              if(f==="log") return;
+              if((keep.session[f]===""||keep.session[f]==null)&&x.session[f]!==""&&x.session[f]!=null)
+                keep.session[f]=x.session[f];
+            });
+            const xl=(x.session&&x.session.log)||[];
+            if(xl.length&&!((keep.session.log||[]).length)) keep.session.log=xl;
+            const xn=String(x.notes||"").trim();
+            if(xn&&String(keep.notes||"").indexOf(xn.slice(0,40))<0)
+              keep.notes=(String(keep.notes||"").trim()+"\n\n"+xn).trim();
+            drop.push(x.id);
+          });
+        });
+        S.batches=S.batches.filter(b=>drop.indexOf(b.id)<0);
+        save("batches"); flash("Removed "+drop.length+" duplicate"+(drop.length===1?"":"s")+".");
+        render(); });
+  }
   else if(a==="new-batch"){ newBatchFrom(null,"New batch"); }
   else if(a==="del-batch"&&b){ const id=b.id, nm=b.name;
     confirmBox("Delete batch","“"+nm+"” and its brew session, readings and notes will be removed.","Delete",
