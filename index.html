@@ -2163,7 +2163,7 @@ function doSplit(){
    taking the newer of each pair by id, and honouring a tombstone newer than the record
    it refers to. Nothing is overwritten wholesale, so two devices can both have worked
    offline and neither loses anything but the field the other changed later. */
-const APP_VERSION="3.13.0";
+const APP_VERSION="3.13.1";
 const SYNC_KEYS=["recipes","batches","inventory","equipProfiles","mashProfiles"];
 
 /* A record is compared ignoring _u, with keys in a fixed order, so a trip through
@@ -2800,12 +2800,21 @@ dlgEl.addEventListener("click",e=>{
     if(!doc) return;
     try{
       if(a==="rs-replace"){
-        /* Start from nothing so the file is the whole truth, and clear the tombstones
-           with it or the old deletions would delete the new records too. */
-        SYNC_KEYS.forEach(k=>{ S[k]=[]; });
-        S.tombs={}; S.openRecipe=null; S.openBatch=null; rebase();
+        /* Replacing is a deletion of everything that was here, and a deletion has to
+           leave a mark or the other device will treat its copies as records this one
+           has simply not seen yet and push them all back. */
+        const now=Date.now();
+        S.tombs=S.tombs||{};
+        SYNC_KEYS.forEach(k=>{
+          S.tombs[k]=S.tombs[k]||{};
+          (S[k]||[]).forEach(r=>{ if(r&&r.id) S.tombs[k][r.id]=now; });
+          S[k]=[];
+        });
+        S.openRecipe=null; S.openBatch=null; rebase();
       }
       restoreDoc(doc);
+      SYNC_KEYS.forEach(k=>save(k));
+      if(a==="rs-replace"&&ADAPTER&&ADAPTER.signedIn()) doSync("replace");
       if(doc.settings&&a==="rs-replace"){ S.settings=Object.assign({},S.settings,doc.settings); save("settings"); }
       flash(a==="rs-replace"?"Replaced from the backup.":"Backup merged.");
       nav();
